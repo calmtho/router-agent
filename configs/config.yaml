@@ -1,0 +1,61 @@
+llm:
+  openai_base_url: "${OPENAI_BASE_URL}"
+  api_key: "${OPENAI_API_KEY}"
+  model_name: "${OPENAI_MODEL_NAME}"
+  temperature: 0.1
+  max_tokens: 1024
+
+milvus:
+  host: "localhost"
+  port: 19530
+  collection_name: "rag_docs"
+  embedding_model: "BAAI/bge-small-zh-v1.5"
+  embedding_dim: 768
+  index_params:
+    metric_type: "IP"
+    index_type: "IVF_FLAT"
+
+mcp:
+  servers:
+    - name: "calculator"
+      command: "python"
+      args: ["-m", "app.mcp_servers.calculator_server"]
+      env: {}
+    - name: "fetch"
+      command: "uvx"
+      args: ["mcp-server-fetch"]
+      env: {}
+
+rag:
+  chunk_size: 500
+  chunk_overlap: 50
+  top_k: 4
+
+paddle_ocr:
+  endpoint: "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+  token: "${PADDLEOCR_ACCESS_TOKEN}"
+  model: "PaddleOCR-VL-1.6"
+
+main_agent:
+  cot_prompt_template: |
+    你是一个智能路由器。用户问题是：{query}
+    可用的子代理：
+    - chat：一般对话、闲聊、问候、回顾对话历史
+    - rag：需要外部知识/文档检索（用户上传了文件或询问文档内容）
+    - mcp：需要工具执行具体操作（数学计算、加减乘除、单位转换、汇率查询、天气查询、网页抓取等）
+    请用 JSON 格式输出你的决策，包含 "target" 和 "reasoning" 字段。
+    例如：{"target": "mcp", "reasoning": "用户需要进行数学计算"}
+    例如：{"target": "rag", "reasoning": "用户询问上传的文档内容"}
+    例如：{"target": "chat", "reasoning": "一般问候对话"}
+  fallback_agent: "chat"
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  max_file_size_mb: 10
+
+langfuse:                          # Langfuse 可观测性配置（可选）
+  enabled: true                    # 是否启用链路追踪，默认 false
+  host: "${LANGFUSE_BASE_URL}"     # Langfuse 服务地址，默认 https://cloud.langfuse.com
+  public_key: "${LANGFUSE_PUBLIC_KEY}"   # 公开密钥（从 Langfuse 项目设置获取）
+  secret_key: "${LANGFUSE_SECRET_KEY}"   # 密钥（从 Langfuse 项目设置获取）
