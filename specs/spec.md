@@ -34,7 +34,21 @@
                             └─────────────┘
 ```
 
-## 2.5 文件上传异步处理
+### 1.1 文件上传交互流程
+
+用户通过 `/upload` 上传文件后，系统采用「异步处理 + 状态轮询」模式：
+
+1. 用户上传文件 → 服务端立即返回 `file_id`（status: processing）
+2. 后台异步执行：解析文本 → 切片 → 向量化 → 写入 Milvus
+3. 前端轮询 `/upload/status/{file_id}`，处理完成获得 status: ready
+4. 用户发送消息并附带 `file_ids` → Router 路由到 RAG Agent → Milvus 检索相关 chunk → LLM 生成回答
+
+> 该流程将 upload（用户侧，低延迟）与 chunk/index（计算密集）合在同一服务中，仅为简化演示。
+> 生产环境建议拆分为独立的 upload 服务和 index 服务，详见 2.1 节。
+
+## 2. 组件详述
+
+### 2.1 文件上传异步处理
 
 - **文件**: `app/routers/upload.py`
 - **职责**: 文件上传 + 后台异步切片 + 向量化入库
@@ -50,10 +64,9 @@
   6. 完成后更新状态为 `ready`，失败则标记为 `error`
 - **前端集成**: 前端通过轮询 `/upload/status/{file_id}` 获取状态，上传时显示 `⏳`，分析完成显示 `✅`，处理期间锁定发送按钮
 - **状态值**: `processing`（处理中） / `ready`（已就绪） / `error`（失败）
+- **架构说明**: 当前 upload 与 chunk 在同一服务中，仅为简化演示。生产环境中建议拆分为独立的 upload 服务（用户侧，低延迟）和 index 服务（计算密集，可 GPU 加速、独立扩缩容），详见 1.1 节。
 
-## 2. 组件详述
-
-### 2.1 Preprocess Node（预处理节点）
+### 2.2 Preprocess Node（预处理节点）
 
 - **文件**: `app/graph/nodes.py`
 - **职责**: 错别字纠正 → 敏感内容过滤（两步串行管道）
@@ -72,7 +85,7 @@
   - 违法相关（贩毒、走私、拐卖等）
   - 其他敏感词（自杀、跳楼等）
 
-### 2.1.1 TypoCorrector 错别字纠正服务
+### 2.2.1 TypoCorrector 错别字纠正服务
 
 - **文件**: `app/services/typo_service.py`
 - **模型**: `shibing624/macbert4csc-base-chinese`（MacBERT for Chinese Spelling Correction）
@@ -90,14 +103,14 @@
     typo_model: "shibing624/macbert4csc-base-chinese"
   ```
 
-### 2.2 Router Node（路由节点）
+### 2.3 Router Node（路由节点）
 
 - **文件**: `app/graph/nodes.py`
 - **职责**: 通过 CoT Prompt 引导 LLM 推理，决策路由到哪个子代理
 - **输出格式**: `{"target": "rag|chat|mcp", "reasoning": "..."}`
 - **降级策略**: 目标代理执行失败时，回退至 `fallback_agent`（默认 `chat`）
 
-### 2.3 Chat Agent（闲聊代理）
+### 2.4 Chat Agent（闲聊代理）
 
 - **文件**: `app/agents/chat_agent.py`
 - **职责**: 通用对话，直接将用户消息发送给 LLM 生成回复
@@ -109,7 +122,7 @@
   4. 对话历史（滑动窗口内的近期消息）
   5. 当前用户消息
 
-### 2.4 RAG Agent（检索增强代理）
+### 2.5 RAG Agent（检索增强代理）
 
 - **文件**: `app/agents/rag_agent.py`
 - **职责**: 基于 Milvus 向量检索 + LLM 生成的文档问答
@@ -120,7 +133,19 @@
   4. 拼接检索结果作为上下文，由 LLM 生成最终回答
 - **回退**: 检索为空时回退为生成式回答
 
-### 2.5 MCP Agent（工具调用代理）
+> ⚠️ **架构说明 — 当前实现为简化演示**
+>
+> 本项目中「文件上传 → 切片 → 向量化 → RAG 检索」是一条龙流水线，**目的是简化路由逻辑、直观展示 RAG 交互流程，同时避免拆分成多个微服务增加示例复杂度**。
+>
+> 生产环境中，文档问答的架构选型取决于场景：
+>
+> | 场景 | 推荐方案 | 说明 |
+> |------|---------|------|
+> | 短文档即时问答 | **VLM + LLM 直接阅读** | 将文档页面截图或转 Markdown 后直接送入 LLM（如 GPT-4o-mini、Qwen-VL），无需切片和检索，延迟低、保真度高 |
+> | 长文档/跨文档检索 | **RAG 流水线** | 文档超出 LLM 上下文窗口或需要跨文档语义检索时，才需要 chunk → embedding → vector DB → retrieve 的完整流程 |
+> | 长期外挂知识库 | **RAG + 独立索引服务** | 知识需要持续更新、多用户共享时，upload 和 chunk/index 应拆为独立服务（upload 低延迟、限流；index 计算密集、可批量/GPU 加速、独立扩缩容） |
+
+### 2.6 MCP Agent（工具调用代理）
 
 - **文件**: `app/agents/mcp_agent.py`
 - **职责**: 调用 MCP 工具执行计算、数据获取等操作
@@ -135,7 +160,7 @@
   6. 将工具返回结果交给 LLM 生成自然语言回答
   7. 带重试机制（最多 3 次），JSON 解析失败自动重试
 
-### 2.6 MCP Server（自定义工具服务器）
+### 2.7 MCP Server（自定义工具服务器）
 
 - **文件**: `app/mcp_servers/calculator_server.py`
 - **协议**: 遵循 Model Context Protocol (MCP)
@@ -147,7 +172,7 @@
   3. 通过 `stdio_server()` 建立双向通信通道
 - **扩展方式**: 在 `app/mcp_servers/` 目录下新建服务器文件，并在 `config.yaml` 中注册
 
-### 2.7 Embedding 服务
+### 2.8 Embedding 服务
 
 - **文件**: `app/services/llm_client.py`
 - **方式**: HuggingFaceEmbeddings（本地 CPU 运行）
@@ -155,7 +180,7 @@
 - **依赖**: `sentence-transformers>=2.7.0`
 - **特点**: 无需外部 API，首次自动下载模型（约 100MB），之后离线可用
 
-### 2.8 Milvus 向量库
+### 2.9 Milvus 向量库
 
 - **文件**: `app/services/milvus_service.py`
 - **版本**: Milvus 2.3.0 (Standalone)
@@ -164,7 +189,7 @@
 - **索引**: IVF_FLAT + Inner Product (IP)
 - **ID 策略**: 每条 chunk 生成 UUID hex 作为主键
 
-### 2.9 会话上下文管理（标题摘要 + 滚动摘要）
+### 2.10 会话上下文管理（标题摘要 + 滚动摘要）
 
 - **文件**: `app/services/history_service.py`
 - **职责**: 管理对话历史的滑动窗口、双层摘要生成与历史裁剪
@@ -200,7 +225,7 @@
 
 - **清理**: `clear_history()` 同时清理标题、摘要和历史
 
-### 2.10 STT 语音转写服务
+### 2.11 STT 语音转写服务
 
 - **文件**: `app/services/stt_service.py` + `app/routers/stt.py`
 - **模型**: FunASR Paraformer-zh（~840MB，含 VAD + 标点恢复子模型）
