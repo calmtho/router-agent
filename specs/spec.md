@@ -307,11 +307,11 @@
 }
 ```
 
-### 3.3 GET /health
+### 3.4 GET /health
 
 健康检查，返回服务状态。
 
-### 3.4 /static（静态文件服务）
+### 3.5 /static（静态文件服务）
 
 - **路径前缀**: `/static`
 - **目录**: `static/`
@@ -320,7 +320,7 @@
 - **示例**: `http://localhost:8000/static/test_stream.html` — 流式聊天测试页面
 - **注意**: `mount` 必须放在所有路由定义之后，否则会截获该路径前缀下的所有请求
 
-### 3.5 POST /stt/transcribe
+### 3.6 POST /stt/transcribe
 
 语音转文字接口，支持 wav、mp3、webm、ogg、flac、m4a 等格式。
 
