@@ -26,12 +26,19 @@ class RAGAgent(SubAgentBase):
         langfuse = get_langfuse_client()
         span = langfuse.span(
             name="rag_agent",
-            input={"query": query, "session_id": session_id, "file_ids": file_ids},
+            input={
+                "query": query,
+                "original_message": context.get("original_message"),
+                "session_id": session_id,
+                "file_ids": file_ids,
+            },
             session_id=session_id,
         ) if langfuse else None
 
         try:
-            result = await rag_chain.run(query, session_id, file_ids=file_ids, chat_history=chat_history)
+            result = await rag_chain.run(
+                query, session_id, file_ids=file_ids, chat_history=chat_history
+            )
             result["agent"] = self.name
 
             if span:
@@ -64,13 +71,20 @@ class RAGAgent(SubAgentBase):
         if langfuse:
             span = langfuse.span(
                 name="rag_agent_stream",
-                input={"query": query, "session_id": session_id, "file_ids": file_ids},
+                input={
+                    "query": query,
+                    "original_message": context.get("original_message"),
+                    "session_id": session_id,
+                    "file_ids": file_ids,
+                },
                 session_id=session_id,
             )
 
         try:
             # 先执行 RAG 检索（非流式）
-            result = await rag_chain.run(query, session_id, file_ids=file_ids, chat_history=chat_history)
+            result = await rag_chain.run(
+                query, session_id, file_ids=file_ids, chat_history=chat_history
+            )
             result["agent"] = self.name
 
             # 流式输出回答内容 - 按字节流式输出，每块约50字符

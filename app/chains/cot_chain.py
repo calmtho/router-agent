@@ -13,7 +13,7 @@ class CoTChain:
     def __init__(self):
         self.prompt_template = config.main_agent.cot_prompt_template
 
-    async def route(self, query: str, has_file: bool = False) -> dict[str, str]:
+    async def route(self, query: str, has_file: bool = False, original_query: str | None = None) -> dict[str, str]:
         """根据用户查询决定路由到哪个子代理"""
         from app.main import get_langfuse_client
 
@@ -31,7 +31,7 @@ class CoTChain:
         max_retries = 3
         span_id = f"cot-route-{uuid.uuid4().hex[:8]}"
         span = langfuse.span(
-            name="cot_routing", id=span_id, input={"query": query, "has_file": has_file}
+            name="cot_routing", id=span_id, input={"query": query, "original_query": original_query, "has_file": has_file}
         ) if langfuse else None
 
         for attempt in range(1, max_retries + 1):

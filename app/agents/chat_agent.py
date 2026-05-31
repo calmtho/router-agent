@@ -25,7 +25,11 @@ class ChatAgent(SubAgentBase):
         session_id = context.get("session_id", "default")
         span = langfuse.span(
             name="chat_agent",
-            input={"query": query, "session_id": session_id},
+            input={
+                "query": query,
+                "original_message": context.get("original_message"),
+                "session_id": session_id,
+            },
             session_id=session_id,
         ) if langfuse else None
 
@@ -58,7 +62,7 @@ class ChatAgent(SubAgentBase):
             history = context.get("chat_history", [])
             messages.extend(history)
 
-            # 添加当前用户消息
+            # 添加当前用户消息（使用纠正后的文本，让 LLM 自然回答）
             messages.append({"role": "user", "content": query})
 
             response = await get_llm_client().chat(messages)
@@ -97,7 +101,11 @@ class ChatAgent(SubAgentBase):
         if langfuse:
             span = langfuse.span(
                 name="chat_agent_stream",
-                input={"query": query, "session_id": session_id},
+                input={
+                    "query": query,
+                    "original_message": context.get("original_message"),
+                    "session_id": session_id,
+                },
                 session_id=session_id,
             )
 
@@ -130,7 +138,7 @@ class ChatAgent(SubAgentBase):
             history = context.get("chat_history", [])
             messages.extend(history)
 
-            # 添加当前用户消息
+            # 添加当前用户消息（使用纠正后的文本，让 LLM 自然回答）
             messages.append({"role": "user", "content": query})
 
             full_answer = ""

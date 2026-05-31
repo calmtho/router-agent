@@ -54,6 +54,11 @@ class MainAgentConfig(BaseModel):
     fallback_agent: str = "chat"
 
 
+class PreprocessConfig(BaseModel):
+    enable_typo_correction: bool = True
+    typo_model: str = "shibing624/macbert4csc-base-chinese"
+
+
 class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8000
@@ -81,6 +86,7 @@ class Config(BaseSettings):
     paddle_ocr: PaddleOCRConfig = Field(default_factory=PaddleOCRConfig)
     main_agent: MainAgentConfig
     server: ServerConfig
+    preprocess: PreprocessConfig = Field(default_factory=PreprocessConfig)
     langfuse: LangfuseConfig = Field(default_factory=LangfuseConfig)
 
 

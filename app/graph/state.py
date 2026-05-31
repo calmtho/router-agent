@@ -1,5 +1,5 @@
 """LangGraph State 定义"""
-from typing import Annotated, Any, Optional
+from typing import Optional
 from typing_extensions import TypedDict
 
 
@@ -9,7 +9,8 @@ class AgentState(TypedDict, total=False):
     total=False 表示所有键都是可选的，后续节点可以动态添加
     """
     # 输入
-    message: str                    # 用户消息
+    message: str                    # 用户消息（可能经过错字纠正）
+    original_message: Optional[str]  # 用户原始输入（未经处理）
     session_id: str                # 会话 ID
     file_ids: Optional[list[str]]  # 引用的文件 IDs
     chat_history: list[dict]       # 聊天历史（最近 N 轮）

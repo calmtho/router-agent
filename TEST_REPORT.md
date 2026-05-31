@@ -1,6 +1,6 @@
 # 代码审查与测试报告
 
-> 最后更新: 2026-05-30
+> 最后更新: 2026-05-31
 
 ## 代码审查发现的问题
 
@@ -55,6 +55,8 @@
 | `tests/test_graph.py` | - | LangGraph 自测脚本（需 LLM 服务，非 pytest 用例） |
 | `tests/test_paddle.py` | - | PaddleOCR API 集成测试（需 token，独立运行） |
 | `tests/test_stt_local.py` | - | FunASR 语音转写本地测试（首次启动下载模型） |
+| `tests/test_preprocess.py` | 3 | 预处理管道：TypoService 纠错、preprocess_node 集成、配置 |
+| `tests/test_imports.py` | - | 模块导入检查（非 pytest 用例） |
 
 ### 测试分类明细
 
@@ -131,6 +133,8 @@
 | funasr | >=1.0.0 | FunASR 语音识别引擎 |
 | modelscope | >=1.0.0 | ModelScope Hub（模型下载） |
 | soundfile | >=0.12.0 | 音频读取 / WAV 转换 |
+| transformers | >=4.40.0 | HuggingFace Transformers（macbert4csc 纠错模型） |
+| torch | >=2.0.0 | PyTorch（TypoCorrector 模型推理） |
 
 ### 已移除的依赖
 - `pypdf` — PDF 改用飞桨 PaddleOCR-VL 云端 OCR 处理
@@ -144,6 +148,7 @@
 - ✅ 文件处理核心功能（TXT、MD、DOCX、PDF mock OCR）
 - ✅ 文本分块算法（Markdown 标题层级切片 + 字符分割）
 - ✅ 会话历史管理（标题摘要、滚动摘要、滑动窗口、历史裁剪、标题与摘要独立共存）
+- ✅ 预处理管道（错字纠正 + 敏感词过滤，`test_preprocess.py`）
 - ⚠️ CoT 推理链（需 LLM 服务）
 - ⚠️ 代理系统（需 LLM / Milvus 服务）
 - ⚠️ 主代理路由逻辑（需 LLM 服务）
@@ -190,11 +195,11 @@
 ### 下一步行动计划
 1. ✅ 修复已发现的代码问题
 2. ✅ 测试文件归入 `tests/` 目录，mock 资源归入 `fixtures/`
-3. ✅ 文档归档同步更新（CLAUDE.md / README.md / spec.md / Learning Guide.md）
-4. ✅ 静态文件服务：`test_stream.html` 移入 `static/` 目录，FastAPI 挂载 `/static` 路径，浏览器访问 `http://localhost:8000/static/test_stream.html`
-5. 🔄 增加 CoT 链和代理的 mock 测试
-6. 🔄 增加 API 端点集成测试（FastAPI TestClient）
-7. ✅ FunASR 本地 STT 功能实现与归档（`stt_service.py`、`stt.py`、`test_stt_local.py`）
+3. ✅ 文档归档同步更新（CLAUDE.md / README.md / specs/spec.md / Learning Guide.md）
+4. ✅ 静态文件服务：`test_stream.html` 移入 `static/` 目录，FastAPI 挂载 `/static` 路径
+5. ✅ FunASR 本地 STT 功能实现与归档（`stt_service.py`、`stt.py`、`test_stt_local.py`）
+6. ✅ 错别字纠正功能实现与归档（`typo_service.py`、`test_preprocess.py`、`test_imports.py`）
+7. ✅ SPEC.md 迁移至 `specs/spec.md` 作为唯一事实标准，根目录不再放设计文档
 8. 🔄 增加 CoT 链和代理的 mock 测试
 9. 🔄 增加 API 端点集成测试（FastAPI TestClient）
 10. 📊 优化测试覆盖目标至 80%+

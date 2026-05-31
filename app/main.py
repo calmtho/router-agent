@@ -122,6 +122,14 @@ async def lifespan(app: FastAPI):
     stt = get_stt_service()
     stt.load_model("paraformer-zh")
 
+    # 预加载 macbert4csc 纠错模型（可选，未安装 transformers 或模型下载失败则跳过）
+    try:
+        from app.services.typo_service import get_typo_corrector
+        corrector = get_typo_corrector()
+        corrector.load_model(config.preprocess.typo_model)
+    except Exception as e:
+        logger.warning(f"Typo correction model preload skipped: {e}")
+
     # 兜底：如果用 uvicorn CLI 启动（不走 __main__），
     # 此处重新启用被 uvicorn dictConfig 禁用的 logger
     setup_logger("app")

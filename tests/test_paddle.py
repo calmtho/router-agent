@@ -34,7 +34,8 @@ if not token:
         print("ERROR: PADDLEOCR_ACCESS_TOKEN not set in environment or .env file")
         sys.exit(1)
 
-with open("_paddle_test_log.txt", "w", encoding="utf-8") as log:
+log_path = Path(__file__).parent / "_paddle_test_log.txt"
+with open(log_path, "w", encoding="utf-8") as log:
     log.write(f"PDF size: {len(pdf_bytes)} bytes\n")
 
     endpoint = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"

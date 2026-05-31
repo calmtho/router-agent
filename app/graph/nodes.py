@@ -1,8 +1,6 @@
 """LangGraph 节点定义 - 复用现有 Agent 实现"""
 
 import json
-import uuid
-from typing import Any
 
 from app.agents.chat_agent import chat_agent
 from app.agents.mcp_agent import mcp_agent
@@ -10,6 +8,7 @@ from app.agents.rag_agent import rag_agent
 from app.config import config
 from app.data.sensitive_words import contains_sensitive_word
 from app.services.llm_client import get_llm_client
+from app.services.typo_service import get_typo_corrector
 from app.utils.logger import logger
 
 from .state import AgentState
@@ -17,19 +16,24 @@ from .state import AgentState
 
 async def preprocess_node(state: AgentState) -> AgentState:
     """
-    预处理节点 - 敏感内容过滤
-
-    检查用户输入是否包含敏感词，如果包含则直接拒绝。
-
-    Returns:
-        如果包含敏感词，返回错误结果
-        如果不包含，返回原状态
+    预处理节点 - 错别字纠正 → 敏感词过滤
     """
     message = state.get("message", "")
+    original_message = message
 
-    # 检查是否包含敏感词
+    # Step 1: 错别字纠正
+    if config.preprocess.enable_typo_correction:
+        try:
+            corrector = get_typo_corrector()
+            corrected, _ = await corrector.correct(message)
+            if corrected != message:
+                logger.info(f"[Preprocess] Typo: {message!r} -> {corrected!r}")
+                message = corrected
+        except Exception as e:
+            logger.warning(f"[Preprocess] Typo correction failed: {e}")
+
+    # Step 2: 敏感词过滤
     is_sensitive, matched_word = contains_sensitive_word(message)
-
     if is_sensitive:
         logger.warning(f"Sensitive content detected: {matched_word}")
         return {
@@ -39,8 +43,11 @@ async def preprocess_node(state: AgentState) -> AgentState:
             "error": "sensitive_content",
         }
 
-    # 不包含敏感词，返回原状态
-    return {}
+    result: AgentState = {}
+    if message != original_message:
+        result["message"] = message
+        result["original_message"] = original_message
+    return result
 
 
 async def router_node(state: AgentState) -> AgentState:
@@ -54,44 +61,27 @@ async def router_node(state: AgentState) -> AgentState:
 
     has_file = bool(state.get("file_ids"))
 
-    # 获取 LLM 客户端用于 Langfuse 追踪
-    from app.main import get_langfuse_client
-    langfuse = get_langfuse_client()
-
-    # 创建 span 用于追踪路由过程
-    span_id = f"cot-route-{uuid.uuid4().hex[:8]}"
-    span = None
-    if langfuse:
-        span = langfuse.span(
-            name="cot_routing",
-            id=span_id,
-            input={"query": state["message"], "has_file": has_file},
-        )
-
     try:
         # 调用 CoT 链进行路由决策
-        routing_result = await cot_chain.route(state["message"], has_file=has_file)
+        # cot_chain.route 内部已包含 Langfuse 追踪
+        routing_result = await cot_chain.route(
+            state["message"],
+            has_file=has_file,
+            original_query=state.get("original_message"),
+        )
 
-        result = {
+        return {
             "target_agent": routing_result.get("target", config.main_agent.fallback_agent),
             "cot_reasoning": routing_result.get("reasoning", ""),
         }
 
-        if span:
-            span.update(output=result)
-
-        return result
-
     except Exception as e:
         logger.error(f"Router node failed: {e}")
-        fallback_result = {
+        return {
             "target_agent": config.main_agent.fallback_agent,
             "cot_reasoning": "路由失败，使用降级代理",
             "error": str(e),
         }
-        if span:
-            span.update(output=fallback_result, status_code=500)
-        return fallback_result
 
 
 async def chat_node(state: AgentState) -> AgentState:
@@ -107,7 +97,11 @@ async def chat_node(state: AgentState) -> AgentState:
     if langfuse:
         span = langfuse.span(
             name="chat_agent",
-            input={"query": state["message"], "session_id": state["session_id"]},
+            input={
+                "query": state["message"],
+                "original_message": state.get("original_message"),
+                "session_id": state["session_id"],
+            },
             session_id=state["session_id"],
         )
 
@@ -147,6 +141,7 @@ async def rag_node(state: AgentState) -> AgentState:
             name="rag_agent",
             input={
                 "query": state["message"],
+                "original_message": state.get("original_message"),
                 "session_id": state["session_id"],
                 "file_ids": state.get("file_ids"),
             },
@@ -187,7 +182,11 @@ async def mcp_node(state: AgentState) -> AgentState:
     if langfuse:
         span = langfuse.span(
             name="mcp_agent",
-            input={"query": state["message"], "session_id": state["session_id"]},
+            input={
+                "query": state["message"],
+                "original_message": state.get("original_message"),
+                "session_id": state["session_id"],
+            },
             session_id=state["session_id"],
         )
 

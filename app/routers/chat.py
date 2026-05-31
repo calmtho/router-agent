@@ -143,6 +143,9 @@ async def chat_stream(body: ChatRequest) -> StreamingResponse:
                 await asyncio.sleep(0.01)  # 确保数据发送
                 return
 
+            # 合并预处理结果（错别字纠正）
+            initial_state.update(preprocessed)
+
             # 2. 执行 CoT 路由节点（流式推理）
             from app.chains.cot_chain import cot_chain
             from app.main import get_langfuse_client
@@ -152,7 +155,11 @@ async def chat_stream(body: ChatRequest) -> StreamingResponse:
             if langfuse:
                 span = langfuse.span(
                     name="cot_routing_stream",
-                    input={"query": body.message, "has_file": bool(body.file_ids)},
+                    input={
+                        "query": body.message,
+                        "original_message": initial_state.get("original_message"),
+                        "has_file": bool(body.file_ids),
+                    },
                     session_id=initial_state["session_id"],
                 )
 
@@ -194,18 +201,20 @@ async def chat_stream(body: ChatRequest) -> StreamingResponse:
             agent_used = target_agent
             answer_full = ""
 
+            query = initial_state.get("message", body.message)
+
             if target_agent == "chat":
-                async for chunk in chat_agent.handle_stream(body.message, initial_state):
+                async for chunk in chat_agent.handle_stream(query, initial_state):
                     answer_full += chunk
                     yield f"data: {json.dumps({'type': 'answer', 'content': chunk}, ensure_ascii=False)}\n\n"
                     await asyncio.sleep(0.01)  # 确保数据发送
             elif target_agent == "rag":
-                async for chunk in rag_agent.handle_stream(body.message, initial_state):
+                async for chunk in rag_agent.handle_stream(query, initial_state):
                     answer_full += chunk
                     yield f"data: {json.dumps({'type': 'answer', 'content': chunk}, ensure_ascii=False)}\n\n"
                     await asyncio.sleep(0.01)  # 确保数据发送
             elif target_agent == "mcp":
-                async for chunk in mcp_agent.handle_stream(body.message, initial_state):
+                async for chunk in mcp_agent.handle_stream(query, initial_state):
                     answer_full += chunk
                     yield f"data: {json.dumps({'type': 'answer', 'content': chunk}, ensure_ascii=False)}\n\n"
                     await asyncio.sleep(0.01)  # 确保数据发送

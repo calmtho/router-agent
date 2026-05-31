@@ -54,6 +54,10 @@ server:
   port: 8000
   max_file_size_mb: 10
 
+preprocess:
+  enable_typo_correction: true
+  typo_model: "shibing624/macbert4csc-base-chinese"
+
 langfuse:                          # Langfuse 可观测性配置（可选）
   enabled: true                    # 是否启用链路追踪，默认 false
   host: "${LANGFUSE_BASE_URL}"     # Langfuse 服务地址，默认 https://cloud.langfuse.com

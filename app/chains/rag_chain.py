@@ -43,12 +43,14 @@ class RAGChain:
         if summary:
             prompt += f"\n\n【会话摘要】\n{summary}"
 
+        user_block = f"用户问题：{query}"
+
         prompt += f"""
 
 文档内容：
 {context}
 
-用户问题：{query}
+{user_block}
 
 请直接回答问题，不要编造信息。如果需要引用文档，使用 [来源1]、[来源2] 等方式标注。"""
 

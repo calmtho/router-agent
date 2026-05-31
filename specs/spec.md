@@ -1,169 +1,504 @@
-# 1. 系统架构
-## 1.1 总体组件
+# Router Agent — 技术规格说明书
+
+## 1. 系统架构
+
 ```
-[用户] ──► /chat (FastAPI) ──► MainAgent (CoT Router)
-                                      │
-          ┌──────────────┬────────────┼────────────┬──────────────┐
-          ▼              ▼            ▼            ▼              ▼
-   [ChatAgent]   [RAGAgent]   [MCPAgent]   [Other...]    [回退闲聊]
-       │              │            │
-       └──────────────┴────────────┘
-               │
-          [LLM (OpenAI API)]
+┌─────────────────────────────────────────────────┐
+│                   FastAPI 入口                     │
+│        /chat (POST)  /upload (POST)  /stt/transcribe (POST) │
+└──────────────────────┬──────────────────────────┘
+                       │
+              ┌────────▼────────┐
+              │ Preprocess Node  │
+              │(错字纠正→敏感词)  │
+              └───┬───┬───┬─────┘
+                  │   │   │
+         ┌────────┘   │   └────────┐
+         ▼            ▼            ▼
+   ┌──────────┐ ┌──────────┐ ┌──────────┐
+   │Chat Node │ │RAG Node  │ │MCP Node  │
+   └──────────┘ └────┬─────┘ └────┬─────┘
+                     │             │
+              ┌──────▼──────┐      │
+              │Milvus 向量库 │      │
+              └──────┬──────┘      │
+                     │             │
+              ┌──────▼──────┐      │
+              │HuggingFace  │      │
+              │Embedding    │      │
+              │(本地CPU)    │      │
+              └─────────────┘      │
+                            ┌──────▼──────┐
+                            │  MCP Server │
+                            │ (stdio/SSE) │
+                            └─────────────┘
 ```
 
-## 1.2 数据流（以 RAG 为例）
+## 2.5 文件上传异步处理
 
-1. 用户上传文件 + 提问 → POST /chat
-2. 服务端解析文件 → 切割文本 → 生成向量 → 存入 Milvus
-3. MainAgent 使用 CoT 推理 → 输出 `{ "agent": "rag", "query": "..." }`
-4. RAGAgent 从 Milvus 检索 top‑k 文档 → 构建上下文 → 调用 LLM 生成最终回答
-5. 返回结果给用户
+- **文件**: `app/routers/upload.py`
+- **职责**: 文件上传 + 后台异步切片 + 向量化入库
+- **接口**: 
+  - `POST /upload` - 上传文件，立即返回 `file_id` + `status: "processing"`
+  - `GET /upload/status/{file_id}` - 查询文件处理状态
+- **处理流程**:
+  1. 接收文件并保存到本地 `uploads/` 目录
+  2. 注册文件状态为 `processing`
+  3. 提交后台异步任务 `_process_file_background()`
+  4. 立即返回响应，不阻塞用户
+  5. 后台任务负责：解析文本 → 切片（500 字符，重叠 50）→ 向量化 → Milvus 入库
+  6. 完成后更新状态为 `ready`，失败则标记为 `error`
+- **前端集成**: 前端通过轮询 `/upload/status/{file_id}` 获取状态，上传时显示 `⏳`，分析完成显示 `✅`，处理期间锁定发送按钮
+- **状态值**: `processing`（处理中） / `ready`（已就绪） / `error`（失败）
 
+## 2. 组件详述
 
-# 2. API 规范
-## 2.1 聊天接口
+### 2.1 Preprocess Node（预处理节点）
 
-**端点：** POST /chat
+- **文件**: `app/graph/nodes.py`
+- **职责**: 错别字纠正 → 敏感内容过滤（两步串行管道）
+- **处理流程**:
+  1. **错别字纠正**（可配置开关 `preprocess.enable_typo_correction`）：调用 `TypoCorrector` 对用户输入进行纠错，纠正后文本存入 `message`，原始输入存入 `original_message`
+  2. **敏感词过滤**：检测用户输入是否包含敏感词，检测到则直接拒绝返回提示
+- **敏感词词典**: `app/data/sensitive_words.py`
+- **检测方式**: 正则表达式匹配
+- **处理方式**: 检测到敏感词时直接拒绝，返回提示信息
+- **状态字段**: 若错字被纠正，`original_message` 保留原始输入，`message` 为纠正后文本，供后续节点和 LLM 使用
+- **支持的敏感词类型**:
+  - 政治相关（共产党、政府、总统等）
+  - 色情相关（色、黄、裸、性等）
+  - 暴力相关（杀、死、打、砸等）
+  - 辱骂相关（傻逼、SB、渣男等）
+  - 违法相关（贩毒、走私、拐卖等）
+  - 其他敏感词（自杀、跳楼等）
 
-**请求：** multipart/form-data
+### 2.1.1 TypoCorrector 错别字纠正服务
 
-| 参数名 | 类型 | 是否必填 | 描述 |
-|--------|------|----------|------|
-| message | string | 是 | 用户输入的消息 |
-| file | file | 否 | 上传的文档（支持 .txt, .pdf, .md） |
-| session_id | string | 否 | 会话标识，用于维持 Milvus 分区或记忆 |
+- **文件**: `app/services/typo_service.py`
+- **模型**: `shibing624/macbert4csc-base-chinese`（MacBERT for Chinese Spelling Correction）
+- **依赖**: `transformers>=4.40.0` + `torch`
+- **架构特点**:
+  - `get_typo_corrector()` 全局单例，全应用共享一个模型实例
+  - `asyncio.to_thread()` 包装同步推理，不阻塞事件循环
+  - 模型未加载时 `correct()` 原样返回文本，不抛异常
+  - `load_model()` 在 lifespan 启动时预加载（与 STT 模型一起）
+- **输入/输出**: `correct(text) -> (纠正后文本, [(错字, 正字, 位置), ...])`
+- **配置**:
+  ```yaml
+  preprocess:
+    enable_typo_correction: true
+    typo_model: "shibing624/macbert4csc-base-chinese"
+  ```
 
-**响应：** JSON
-```
+### 2.2 Router Node（路由节点）
+
+- **文件**: `app/graph/nodes.py`
+- **职责**: 通过 CoT Prompt 引导 LLM 推理，决策路由到哪个子代理
+- **输出格式**: `{"target": "rag|chat|mcp", "reasoning": "..."}`
+- **降级策略**: 目标代理执行失败时，回退至 `fallback_agent`（默认 `chat`）
+
+### 2.3 Chat Agent（闲聊代理）
+
+- **文件**: `app/agents/chat_agent.py`
+- **职责**: 通用对话，直接将用户消息发送给 LLM 生成回复
+- **特点**: 无外部依赖，纯 LLM 对话
+- **上下文注入**: 构建消息时按顺序注入：
+  1. System prompt（角色设定）
+  2. `【会话主题】` + 标题（如有，5~15 字精炼标题）
+  3. `【历史摘要】` + 滚动摘要（如有，压缩的旧对话摘要）
+  4. 对话历史（滑动窗口内的近期消息）
+  5. 当前用户消息
+
+### 2.4 RAG Agent（检索增强代理）
+
+- **文件**: `app/agents/rag_agent.py`
+- **职责**: 基于 Milvus 向量检索 + LLM 生成的文档问答
+- **流程**:
+  1. 用户先通过 `/upload` 上传文件，文件被分块、向量化后存入 Milvus
+  2. 用户通过 `/chat` 发送 query 并附带 `file_ids`
+  3. RAG Agent 在 Milvus 中检索相关文档块
+  4. 拼接检索结果作为上下文，由 LLM 生成最终回答
+- **回退**: 检索为空时回退为生成式回答
+
+### 2.5 MCP Agent（工具调用代理）
+
+- **文件**: `app/agents/mcp_agent.py`
+- **职责**: 调用 MCP 工具执行计算、数据获取等操作
+- **协议**: 支持 stdio（子进程）和 SSE（HTTP）两种传输方式（当前仅实现 stdio）
+- **客户端**: `app/services/mcp_client.py`
+- **工作流**:
+  1. 启动时从配置读取所有注册的 MCP Server
+  2. 运行时通过 `can_handle()` 关键词匹配判断是否需要工具调用
+  3. 调用所有 MCP Server 的 `list_tools()` 获取可用工具列表
+  4. 将工具列表发送给 LLM，由 LLM 决策调用哪个工具及参数
+  5. 通过 `MCPClient.call_tool()` 执行工具调用
+  6. 将工具返回结果交给 LLM 生成自然语言回答
+  7. 带重试机制（最多 3 次），JSON 解析失败自动重试
+
+### 2.6 MCP Server（自定义工具服务器）
+
+- **文件**: `app/mcp_servers/calculator_server.py`
+- **协议**: 遵循 Model Context Protocol (MCP)
+- **SDK**: 使用 `mcp>=1.0.0,<2.0.0` Python SDK
+- **通信方式**: 通过 stdio（标准输入输出）与客户端进程通信
+- **注册流程**:
+  1. 使用 `@server.list_tools()` 装饰器注册可用工具（定义 name, description, inputSchema）
+  2. 使用 `@server.call_tool()` 装饰器实现工具执行逻辑
+  3. 通过 `stdio_server()` 建立双向通信通道
+- **扩展方式**: 在 `app/mcp_servers/` 目录下新建服务器文件，并在 `config.yaml` 中注册
+
+### 2.7 Embedding 服务
+
+- **文件**: `app/services/llm_client.py`
+- **方式**: HuggingFaceEmbeddings（本地 CPU 运行）
+- **默认模型**: `BAAI/bge-small-zh-v1.5`（768 维，中文优化）
+- **依赖**: `sentence-transformers>=2.7.0`
+- **特点**: 无需外部 API，首次自动下载模型（约 100MB），之后离线可用
+
+### 2.8 Milvus 向量库
+
+- **文件**: `app/services/milvus_service.py`
+- **版本**: Milvus 2.3.0 (Standalone)
+- **连接**: localhost:19530
+- **Collection**: `rag_docs`
+- **索引**: IVF_FLAT + Inner Product (IP)
+- **ID 策略**: 每条 chunk 生成 UUID hex 作为主键
+
+### 2.9 会话上下文管理（标题摘要 + 滚动摘要）
+
+- **文件**: `app/services/history_service.py`
+- **职责**: 管理对话历史的滑动窗口、双层摘要生成与历史裁剪
+- **两种摘要，独立管理**：
+
+|| 类型 | 触发时机 | 目的 | 长度 | 更新频率 | 存储 |
+|------|---------|------|------|---------|------|
+| 标题摘要 | 首次对话后（异步） | UI 展示、会话标识 | 5~15 字 | 生成一次，不再更新 | `_session_titles` |
+| 滚动摘要 | 对话超阈值（默认 10 轮，异步） | 上下文窗口管理，压缩旧历史 | 50~200 字 | 每次超阈值增量更新 | `_session_summaries` |
+
+- **标题摘要 (`generate_title`)**:
+  1. 首次对话结束后异步触发（`chat.py` 中 `asyncio.create_task`）
+  2. 已有标题则跳过，不重复生成
+  3. 只取前 2 轮对话作为素材，prompt 要求直接输出标题
+  4. 后处理：剥离推理泄漏（按分隔符取最后一段）、清理前缀/引号、限制 20 字
+  5. 以 `【会话主题】{title}` 注入 LLM 上下文
+
+- **滚动摘要 (`generate_summary`)**:
+  1. 对话轮数 > 阈值（默认 10）时异步触发
+  2. 带锁（`_summary_locks`），防止并发更新
+  3. 将超出阈值的旧对话交给 LLM 生成摘要，已有旧摘要时追加为上下文
+  4. 生成后裁剪历史，只保留最近 `keep_rounds` 轮
+  5. 以 `【历史摘要】\n{summary}` 注入 LLM 上下文
+
+- **上下文注入顺序**（`chat_agent.py`）:
+  ```
+  System: 你是一个友好、专业的 AI 助手...
+  System: 【会话主题】关于高等数学学习的对话
+  System: 【历史摘要】用户叫 AI 小张，正在学习高数...
+  User: (近期对话历史)
+  User: (当前消息)
+  ```
+
+- **清理**: `clear_history()` 同时清理标题、摘要和历史
+
+### 2.10 STT 语音转写服务
+
+- **文件**: `app/services/stt_service.py` + `app/routers/stt.py`
+- **模型**: FunASR Paraformer-zh（~840MB，含 VAD + 标点恢复子模型）
+- **依赖**: `funasr>=1.0.0`, `modelscope>=1.0.0`, `soundfile>=0.12.0`
+- **输入**: 16kHz mono WAV（路由层通过 `_ensure_wav()` 兜底转换 mp3/webm/ogg 等）
+- **输出**: 带标点的中文文本
+- **架构特点**:
+  - lifespan 启动时预加载模型，避免首次请求等待
+  - `get_stt_service()` 全局单例，全应用共享一个模型实例
+  - `asyncio.to_thread()` 包装同步推理，不阻塞事件循环
+- **前端集成**: `static/test_stream.html` 通过 Web Audio API 直出 PCM 并手动封装 WAV，保证标准格式
+
+## 3. API 接口
+
+### 3.1 POST /upload
+
+上传文件，立即返回，后台异步切片并向量化存入 Milvus。
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `file` | UploadFile | 要上传的文档（PDF/TXT/MD/DOCX） |
+| `session_id` | Form string | 会话标识（可选，默认 "default"） |
+
+**响应**:
+```json
 {
-  "reply": "字符串，代理的最终回答",
-  "agent_used": "rag | chat | mcp",
-  "cot_reasoning": "主代理的思考链（可选）"
+  "file_id": "a1b2c3d4e5f6",
+  "filename": "document.pdf",
+  "status": "processing"
 }
 ```
 
-## 2.2 健康检查
-端点：GET /health → {"status": "ok"}
+**处理流程**:
+1. 接收文件并保存到本地 `uploads/` 目录
+2. 注册文件状态为 `processing`
+3. 提交后台异步任务（切片 + 向量化）
+4. 立即返回 `file_id` 和 `status: "processing"`
 
-# 3. 配置规范
+**状态查询**: 通过 `GET /upload/status/{file_id}` 查询文件处理状态（`processing` / `ready` / `error`）
 
-**配置文件** `configs/config.yaml` 示例：
+**前端集成**: 前端通过轮询方式获取文件处理状态，上传时显示 `⏳`，分析完成显示 `✅`，处理期间锁定发送按钮。
+
+### 3.2 GET /upload/status/{file_id}
+
+查询文件处理状态。
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `file_id` | path string | 文件 ID |
+
+**响应**:
+```json
+{
+  "file_id": "a1b2c3d4e5f6",
+  "filename": "document.pdf",
+  "session_id": "default",
+  "status": "ready",
+  "chunks": 5
+}
 ```
-llm:
-  openai_base_url: "https://api.openai.com/v1"
-  api_key: "${OPENAI_API_KEY}"        # 支持环境变量替换
-  model_name: "gpt-4o-mini"
-  temperature: 0.7
-  max_tokens: 1024
 
-milvus:
-  host: "localhost"
-  port: 19530
-  collection_name: "rag_docs"
-  embedding_model: "text-embedding-3-small"   # 使用 OpenAI 嵌入
-  embedding_dim: 1536
+### 3.3 POST /chat
+
+发送消息，由 Main Agent 路由到合适的子代理处理。
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `message` | string | 用户消息 |
+| `session_id` | string | 会话标识（可选） |
+| `file_ids` | string[] | 引用已上传文件的 ID 列表（可选） |
+
+**响应**:
+```json
+{
+  "reply": "回答内容",
+  "agent_used": "rag",
+  "cot_reasoning": "用户询问上传的文档内容",
+  "sources": ["相关片段1", "相关片段2"]
+}
+```
+
+### 3.3 GET /health
+
+健康检查，返回服务状态。
+
+### 3.4 /static（静态文件服务）
+
+- **路径前缀**: `/static`
+- **目录**: `static/`
+- **实现**: FastAPI `StaticFiles` 中间件，启用 `html=True` 模式
+- **用途**: 提供开发测试页面等静态资源
+- **示例**: `http://localhost:8000/static/test_stream.html` — 流式聊天测试页面
+- **注意**: `mount` 必须放在所有路由定义之后，否则会截获该路径前缀下的所有请求
+
+### 3.5 POST /stt/transcribe
+
+语音转文字接口，支持 wav、mp3、webm、ogg、flac、m4a 等格式。
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `file` | UploadFile | 音频文件 |
+
+**响应**:
+```json
+{
+  "text": "转写结果文本",
+  "model": "paraformer-zh",
+  "duration_ms": 1250
+}
+```
+
+**前端集成**: 前端通过 Web Audio API 录制 16kHz mono WAV，以 FormData 上传。
+
+## 4. 配置文件
+
+### 4.1 config.yaml 结构
+
+```yaml
+llm:                          # LLM 对话模型（OpenAI 兼容 API）
+  openai_base_url: "..."      # API 地址
+  api_key: "${OPENAI_API_KEY}" # API 密钥（支持环境变量）
+  model_name: "..."           # 模型名
+  temperature: 0.1            # 温度参数
+  max_tokens: 1024            # 最大输出 token
+
+milvus:                       # 向量数据库 + Embedding
+  host: "localhost"           # Milvus 地址
+  port: 19530                 # Milvus 端口
+  collection_name: "rag_docs" # 集合名
+  embedding_model: "BAAI/bge-small-zh-v1.5"  # HuggingFace 模型
+  embedding_dim: 768          # 向量维度
   index_params:
-    metric_type: "IP"
-    index_type: "IVF_FLAT"
+    metric_type: "IP"         # 相似度度量（IP = 内积，等价余弦）
+    index_type: "IVF_FLAT"    # 索引类型
 
-mcp:
+mcp:                          # MCP 工具服务器
   servers:
-    - name: "calculator"
-      command: "python"
-      args: ["-m", "mcp_server_calc"]
+    - name: "calculator"        # 服务器名称
+      command: "python"         # 启动命令
+      args: ["-m", "app.mcp_servers.calculator_server"]  # 启动参数
+      env: {}                   # 环境变量（可选）
+    - name: "fetch"
+      command: "uvx"
+      args: ["mcp-server-fetch"]
       env: {}
-    - name: "weather"
-      url: "http://localhost:5000/mcp"   # 支持 SSE/HTTP 传输
+  # url 字段用于 SSE 传输（当前未实现）
 
-rag:
-  chunk_size: 500
-  chunk_overlap: 50
-  top_k: 4
+rag:                          # RAG 参数
+  chunk_size: 500             # 文档分块大小
+  chunk_overlap: 50           # 分块重叠
+  top_k: 4                    # 检索返回数
 
-main_agent:
-  cot_prompt_template: |
-    你是一个智能路由器。用户问题是：{query}
-    可用的子代理：chat（一般对话）、rag（需要外部知识/文档）、mcp（需要工具计算/实时数据）。
-    请用 JSON 格式输出你的决策，包含 "target" 和 "reasoning" 字段。
-    例如：{"target": "rag", "reasoning": "用户询问上传的文档内容"}
-  fallback_agent: "chat"
+paddle_ocr:                   # 飞桨 PaddleOCR 云端 OCR
+  endpoint: "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+  token: "${PADDLEOCR_ACCESS_TOKEN}"
+  model: "PaddleOCR-VL-1.6"
 
-server:
+main_agent:                   # 主代理配置（LangGraph 使用）
+  cot_prompt_template: |      # CoT 推理提示模板
+    ...
+  fallback_agent: "chat"      # 降级代理
+
+preprocess:                   # 预处理管道配置
+  enable_typo_correction: true                    # 是否启用错别字纠正
+  typo_model: "shibing624/macbert4csc-base-chinese" # 纠错模型名
+
+server:                       # 服务器配置
   host: "0.0.0.0"
   port: 8000
   max_file_size_mb: 10
+
+langfuse:                     # Langfuse 可观测性配置（可选）
+  enabled: true
+  host: "${LANGFUSE_BASE_URL}"
+  public_key: "${LANGFUSE_PUBLIC_KEY}"
+  secret_key: "${LANGFUSE_SECRET_KEY}"
 ```
 
-# 4. 关键模块设计
-## 4.1 MainAgent (CoT)
+### 4.2 配置优先级
 
-**输入：** user_query, uploaded_files_info
+YAML 文件 → 环境变量（`APP_*` 前缀）→ Pydantic 默认值
 
-1. 构造 CoT Prompt，调用 LLM 获取路由决策
-2. 解析 JSON 结果，分发到对应子代理
-3. 若解析失败或子代理不存在，则调用 fallback_agent
+环境变量示例:
+```bash
+export APP_LLM_MODEL_NAME="gpt-4o"
+export APP_MILVUS_HOST="192.168.1.100"
+export APP_SERVER_PORT=8080
+```
 
-## 4.2 RAGAgent
+## 5. 依赖清单
 
-使用 LangChain 的 Milvus 向量存储 + OpenAIEmbeddings
+| 包 | 版本 | 用途 |
+|------|------|------|
+| fastapi | >=0.115.0 | Web 框架 |
+| uvicorn[standard] | 0.34.0 | ASGI 服务器 |
+| openai | >=1.58.1,<2.0.0 | LLM API 客户端 |
+| pymilvus | 2.5.0 | Milvus SDK |
+| langchain | 0.3.0 | 编排框架 |
+| langchain-openai | 0.3.0 | LangChain OpenAI 集成 |
+| langchain-community | 0.3.0 | LangChain 社区集成（HuggingFace Embedding 等） |
+| sentence-transformers | >=2.7.0 | 本地 Embedding 模型 |
+| python-docx | 1.1.0 | DOCX 解析 |
+| httpx | 0.27.2 | HTTP 客户端（PaddleOCR API 调用等） |
+| mcp | >=1.0.0,<2.0.0 | MCP 协议 SDK |
+| pyyaml | 6.0.1 | YAML 配置解析 |
+| pydantic | 2.11.0 | 数据验证 |
+| pydantic-settings | 2.9.0 | 配置管理 |
+| langgraph | >=0.2.0,<0.3.0 | LangGraph 图编排 |
+| langfuse | >=2.0,<3.0 | 链路追踪与可观测性 |
+| funasr | >=1.0.0 | FunASR 语音识别引擎（Paraformer-zh） |
+| modelscope | >=1.0.0 | ModelScope Hub（模型下载） |
+| soundfile | >=0.12.0 | 音频读取 / WAV 转换 |
+| transformers | >=4.40.0 | HuggingFace Transformers（macbert4csc 纠错模型） |
+| torch | >=2.0.0 | PyTorch（TypoCorrector 模型推理） |
 
-**文件处理流水线：**
+> **已移除的依赖：** `pypdf`（PDF 改用飞桨 PaddleOCR-VL 云端 OCR）、`markdown` + `beautifulsoup4`（MD 不再转 HTML，直接保留原文）、`reportlab`（测试 mock PDF 改用 `fixtures/` 预生成文件）、`torchaudio`（改用 soundfile 处理音频）。
 
-1. 根据后缀选择解析器（PyPDF2, textract, 等）
-2. 分块：RecursiveCharacterTextSplitter
-3. 生成嵌入并插入 Milvus（每个会话独立 partition）
-4. 检索相关块（similarity_search_with_score）
-5. 构建 Prompt 并调用 LLM 生成回答
+## 6. Docker 服务
 
-## 4.3 MCPAgent
+| 服务 | 镜像 | 端口 |
+|------|------|------|
+| etcd | quay.io/coreos/etcd:v3.5.5 | 2379 |
+| minio | minio/minio:RELEASE.2023-03-20 | 9000, 9001 |
+| milvus-standalone | milvusdb/milvus:v2.3.0 | 19530, 9091 |
 
-使用 mcp 客户端连接配置中定义的 MCP 服务器
+## 7. 文件解析支持
 
-支持两种传输：stdio（子进程）和 sse（HTTP）
+| 格式 | 解析库 | 说明 |
+|------|------|------|
+| .txt | 内置 | 纯文本直接读取 |
+| .pdf | 飞桨 PaddleOCR-VL 云端 API | OCR 识别转 Markdown，需配置 `PADDLEOCR_ACCESS_TOKEN` |
+| .md | 内置 | 直接保留原文，不转 HTML |
+| .docx | python-docx | 结构化提取标题层级 + 表格 → Markdown |
 
-**工具调用流程：**
+**测试资源：** 测试用静态文件统一存放在 `fixtures/` 目录（如 `rag_test_document.pdf`），纳入 git 版本管理，无需运行时生成。
 
-1. 主代理识别需要调用工具
-2. 提取工具名称和参数
-3. 通过 MCP 协议调用对应服务器
-4. 返回结果给主代理或直接输出
+## 8. 子代理注册规范
 
-## 4.4 ChatAgent
+所有子代理必须继承 `SubAgentBase` 并实现：
 
-简单的对话生成，可携带对话历史（基于 session_id 的内存缓存）
+```python
+class SubAgentBase:
+    name: str                                  # 代理名称
+    async def can_handle(self, query, context) -> bool  # 是否可处理
+    async def handle(self, query, context) -> dict       # 处理请求
+```
 
-不涉及工具或外部检索
+`handle()` 返回格式:
+```python
+{
+    "answer": "响应文本",
+    "agent_used": "代理名",
+    "sources": ["可选", "引用来源"]
+}
+```
 
-# 5. 异常处理与日志
+## 9. Langfuse 可观测性
 
-1. 所有外部调用（LLM, Milvus, MCP）捕获异常并记录结构化日志
-2. 当 LLM 调用超时或返回错误时，返回友好错误信息
-3. 文件上传失败时仅处理文本消息，忽略文件部分
+### 9.1 概述
 
-# 6. 部署要求
+项目集成 Langfuse 进行 LLM 调用链路追踪，自动记录：
+- **Trace**：单次请求的完整调用链（Main Agent → 子代理 → LLM）
+- **Span**：关键步骤的耗时（CoT 推理、RAG 检索、MCP 工具调用）
+- **Generation**：LLM 调用详情（输入/输出 tokens、耗时、模型名）
 
-1. **Milvus**：Standalone 模式（推荐 Docker Compose 一键启动）
-2. **Python 依赖**：`requirements.txt` 需包含 fastapi, langchain, pymilvus, mcp, openai, python-multipart, pyyaml, uvicorn
-3. **环境变量**：`OPENAI_API_KEY` 必须设置
+### 9.2 配置方式
 
-# 7. 测试要点
+在 `.env` 文件中设置：
 
-**单元测试：**
+```bash
+# Langfuse 配置
+LANGFUSE_ENABLED=true
+LANGFUSE_PUBLIC_KEY=pk-lf-xxx
+LANGFUSE_SECRET_KEY=sk-lf-xxx
+LANGFUSE_BASE_URL=https://cloud.langfuse.com
+```
 
-1. CoT 路由解析逻辑
-2. 文件分块与嵌入流程
-3. MCP 客户端模拟调用
+配置优先级：`.env` → `config.yaml` → 默认值
 
-**集成测试：**
+### 9.3 使用说明
 
-1. 完整聊天流程（含文件）
-2. Milvus 插入 / 检索正确性
-3. 路由到正确子代理
+启用后，以下操作会自动被追踪：
 
-# 8. 扩展计划
+| 操作 | Trace 名称 | Span 名称 |
+|------|------------|-----------|
+| Main Agent 路由 | `main_agent` | `cot_routing` |
+| Chat Agent | `chat_agent` | `chat_agent` |
+| RAG Agent | `rag_agent` | `rag_agent` |
+| MCP Agent | `mcp_agent` | `mcp_agent` |
+| LangChain LLM 调用 | 自动创建 | `LLM` |
 
-1. 支持更多文件类型（.docx, .html）
-2. 增加会话记忆（LangChain ConversationBufferMemory）
-3. 多模态输入（图像 → 描述 → 检索）
-4. 异步 MCP 工具流式输出
+### 9.4 查看追踪数据
+
+1. 访问 [Langfuse Dashboard](https://cloud.langfuse.com)
+2. 使用 `LANGFUSE_PUBLIC_KEY` 对应的项目
+3. 在 Traces 页面查看请求链路
+4. 点击 Trace 可查看详细调用信息、耗时、输入输出等
+
+### 9.5 关闭可观测性
+
+将 `LANGFUSE_ENABLED` 设置为 `false` 或直接删除相关配置即可。

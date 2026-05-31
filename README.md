@@ -7,6 +7,7 @@
 | 功能 | 描述 |
 |------|------|
 | **智能路由** | 主代理通过 CoT 推理自动分发用户请求到合适的子代理 |
+| **错别字纠正** | 基于 macbert4csc 的中文错别字自动纠正，预处理管道第一步 |
 | **文档问答** | 基于 Milvus 向量库的 RAG 增强，支持 PDF、TXT、MD、DOCX 文件 |
 | **工具调用** | 遵循 Model Context Protocol 调用外部工具（计算器、API 等） |
 | **自由对话** | 提供通用对话能力，支持 OpenAI 兼容的大模型 |
@@ -402,6 +403,10 @@ curl -X POST http://localhost:8000/stt/transcribe \
 │   ├── cot_prompt_template   # CoT 推理提示模板
 │   └── fallback_agent        # 降级代理
 │
+├── preprocess       # 预处理管道配置
+│   ├── enable_typo_correction # 是否启用错别字纠正
+│   └── typo_model            # 纠错模型名称
+│
 └── server           # 服务器配置
     ├── host                  # 监听地址
     ├── port                  # 监听端口
@@ -435,6 +440,7 @@ python tests/test_paddle.py
 - ✅ 会话历史管理：标题摘要、滚动摘要、裁剪、共存（`test_history.py`）
 - ✅ PaddleOCR API 集成测试（`test_paddle.py`，需 token）
 - ✅ FunASR 语音转写本地测试（`tests/test_stt_local.py`）
+- ✅ 预处理管道：错字纠正 + 敏感词过滤（`tests/test_preprocess.py`）
 
 **测试资源：** 静态测试文件统一存放在 `fixtures/` 目录，纳入 git 版本管理，无需运行时生成。
 
@@ -463,8 +469,11 @@ router_agent/
 │   │   ├── llm_client.py       # LLM + 本地 Embedding
 │   │   ├── mcp_client.py       # MCP 客户端（stdio 子进程通信）
 │   │   ├── milvus_service.py   # 向量库服务
+│   │   ├── mcp_client.py       # MCP 客户端（stdio 子进程通信）
 │   │   ├── history_service.py  # 对话历史管理（标题/摘要生成、滑动窗口、历史裁剪）
-│   │   └── stt_service.py      # STT 语音转写服务（FunASR 封装）
+│   │   ├── llm_client.py       # LLM + 本地 Embedding
+│   │   ├── stt_service.py      # STT 语音转写服务（FunASR 封装）
+│   │   └── typo_service.py     # 错别字纠正服务（macbert4csc 封装）
 │   ├── mcp_servers/            # MCP 工具服务器
 │   │   └── calculator_server.py # 计算器工具示例
 │   └── utils/                  # 工具函数
@@ -484,13 +493,16 @@ router_agent/
 │   ├── test_graph.py           # LangGraph 路由自测脚本
 │   ├── test_history.py         # 会话历史管理测试
 │   ├── test_paddle.py          # PaddleOCR API 集成测试
-│   └── test_stt_local.py       # FunASR 语音转写本地测试
+│   ├── test_stt_local.py       # FunASR 语音转写本地测试
+│   ├── test_preprocess.py       # 预处理管道测试（错字纠正 + 敏感词过滤）
+│   └── test_imports.py          # 模块导入检查
 ├── docker-compose.yml          # Docker 编排文件
 ├── Dockerfile                  # Docker 镜像构建文件
 ├── requirements.txt            # Python 依赖
 ├── CLAUDE.md                   # 项目说明文档
 ├── README.md                   # 本文件
-└── spec.md                     # 技术规格说明书
+└── specs/
+    └── spec.md                 # 技术规格说明书
 ```
 
 ## 🐳 Docker 部署
@@ -638,4 +650,4 @@ mcp:
 
 ---
 
-**最后更新:** 2026-05-30
+**最后更新:** 2026-05-31

@@ -63,7 +63,11 @@ class MCPAgent(SubAgentBase):
         langfuse = get_langfuse_client()
         span = langfuse.span(
             name="mcp_agent",
-            input={"query": query, "session_id": session_id},
+            input={
+                "query": query,
+                "original_message": context.get("original_message"),
+                "session_id": session_id,
+            },
             session_id=session_id,
         ) if langfuse else None
 
@@ -105,7 +109,7 @@ class MCPAgent(SubAgentBase):
         # 添加历史消息
         for msg in chat_history:
             messages.append({"role": msg["role"], "content": msg["content"]})
-        # 添加工具描述和当前问题
+        # 添加工具描述和当前问题（使用纠正后的文本）
         messages.append({
             "role": "user",
             "content": f"""用户问题是：{query}
@@ -219,7 +223,11 @@ class MCPAgent(SubAgentBase):
         if langfuse:
             span = langfuse.span(
                 name="mcp_agent_stream",
-                input={"query": query, "session_id": session_id},
+                input={
+                    "query": query,
+                    "original_message": context.get("original_message"),
+                    "session_id": session_id,
+                },
                 session_id=session_id,
             )
 

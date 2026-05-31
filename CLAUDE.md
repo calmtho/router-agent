@@ -2,15 +2,16 @@
 本项目实现一个基于 Chain‑of‑Thought (CoT) 的 Main‑Sub Agent 架构智能代理系统，具备以下核心能力：
 
 1. **智能路由**：主代理通过 CoT 推理决定将用户请求分发至合适的子代理（闲聊 / RAG / MCP 工具调用）。
-2. **内容安全过滤**：预处理节点检测并拦截包含敏感词的用户请求，防止不当内容进入系统。
-3. **MCP 工具调用**：子代理遵循 Model Context Protocol 调用外部工具。MCP Server 通过 stdio 子进程启动，支持计算器、网页抓取等工具。自定义 Server 可放在 `app/mcp_servers/` 目录下，在 `config.yaml` 中注册即可。
-4. **RAG 增强生成**：子代理基于 Milvus 向量库进行检索增强，支持文件上传与文档问答。
-5. **自由闲聊**：子代理提供通用对话能力。
-6. **会话上下文管理**：双层摘要机制——标题摘要（首次对话生成，用于 UI 展示）+ 滚动摘要（超阈值触发，用于上下文窗口管理），历史自动裁剪。
-7. **可观测性**：集成 Langfuse 进行 LLM 调用链路追踪，支持 Trace、Span、Generation 等多种观测类型。
-7. **配置文件驱动**：所有模型、连接、超参数等均通过配置文件管理。
-8. **语音转写（STT）**：基于 FunASR Paraformer-zh 本地模型的中文语音转文字，前端一键录音上传，结果自动填入输入框。
-9. **OpenAI 兼容模型**：支持任何提供 OpenAI API 协议的大模型（如 GPT‑4、DeepSeek、本地 vLLM 等）。
+2. **错别字纠正**：预处理管道第一步，基于 macbert4csc 自动纠正中文错别字，纠正后保留原文到 `original_message`。
+3. **内容安全过滤**：预处理管道第二步，检测并拦截包含敏感词的用户请求，防止不当内容进入系统。
+4. **MCP 工具调用**：子代理遵循 Model Context Protocol 调用外部工具。MCP Server 通过 stdio 子进程启动，支持计算器、网页抓取等工具。自定义 Server 可放在 `app/mcp_servers/` 目录下，在 `config.yaml` 中注册即可。
+5. **RAG 增强生成**：子代理基于 Milvus 向量库进行检索增强，支持文件上传与文档问答。
+6. **自由闲聊**：子代理提供通用对话能力。
+7. **会话上下文管理**：双层摘要机制——标题摘要（首次对话生成，用于 UI 展示）+ 滚动摘要（超阈值触发，用于上下文窗口管理），历史自动裁剪。
+8. **可观测性**：集成 Langfuse 进行 LLM 调用链路追踪，支持 Trace、Span、Generation 等多种观测类型。
+9. **配置文件驱动**：所有模型、连接、超参数等均通过配置文件管理。
+10. **语音转写（STT）**：基于 FunASR Paraformer-zh 本地模型的中文语音转文字，前端一键录音上传，结果自动填入输入框。
+11. **OpenAI 兼容模型**：支持任何提供 OpenAI API 协议的大模型（如 GPT‑4、DeepSeek、本地 vLLM 等）。
 
 # 技术栈
 
@@ -27,6 +28,7 @@
 | MCP 服务器 | `app/mcp_servers/` 目录（自定义工具 Server） |
 | 配置管理 | Pydantic Settings + YAML |
 | 异步支持 | asyncio + httpx |
+| 错别字纠正 | macbert4csc-base-chinese (transformers + torch) |
 | 语音识别 | FunASR (Paraformer-zh) + soundfile + ModelScope |
 | 测试框架 | pytest + pytest-asyncio |
 
@@ -62,14 +64,15 @@
 │   │   ├── mcp_client.py       # MCP 协议客户端（stdio 子进程通信）
 │   │   ├── history_service.py  # 对话历史管理（标题/摘要生成、滑动窗口、历史裁剪）
 │   │   ├── llm_client.py       # LLM 客户端 + 本地 Embedding
-│   │   └── stt_service.py      # STT 语音转写服务（FunASR Paraformer-zh 封装）
+│   │   ├── stt_service.py      # STT 语音转写服务（FunASR Paraformer-zh 封装）
+│   │   └── typo_service.py     # 错别字纠正服务（macbert4csc 封装）
 │   ├── mcp_servers/            # MCP 工具服务器
 │   │   └── calculator_server.py # 计算器工具示例
 │   └── utils/
 │       ├── file_processor.py   # 文件解析（PDF, txt, md…）
 │       └── logger.py
 ├── configs/
-│   └── config.yaml             # 主配置文件（见 spec.md）
+│   └── config.yaml             # 主配置文件（见 specs/spec.md）
 ├── static/                     # 静态文件（通过 /static 路径访问）
 │   └── test_stream.html        # 流式聊天测试页面
 ├── fixtures/                   # 测试用静态资源（预生成，纳入 git）
@@ -82,12 +85,15 @@
 │   ├── test_graph.py           # LangGraph 路由自测脚本
 │   ├── test_history.py         # 会话历史管理测试
 │   ├── test_paddle.py          # PaddleOCR API 集成测试
-│   └── test_stt_local.py       # FunASR 语音转写本地测试
+│   ├── test_stt_local.py       # FunASR 语音转写本地测试
+│   ├── test_preprocess.py       # 预处理管道测试（错字纠正 + 敏感词过滤）
+│   └── test_imports.py          # 模块导入检查
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml          # 包含 Milvus, etcd, minio
-├── claude.md                   # 本文件
-└── spec.md                     # 技术规格说明书
+├── CLAUDE.md                   # 本文件
+├── specs/
+│   └── spec.md               # 技术规格说明书（事实标准）
 ```
 
 # 快速开始
@@ -143,7 +149,7 @@ curl -X POST http://localhost:8000/stt/transcribe \
 
 # 开发约定
 
-1. **内容安全过滤**：敏感词词典位于 `app/data/sensitive_words.py`，预处理节点 `preprocess_node` 在图入口处检测敏感词。
+1. **内容安全过滤**：敏感词词典位于 `app/data/sensitive_words.py`，预处理节点 `preprocess_node` 在图入口处进行错字纠正→敏感词过滤。
 2. **LangGraph 路由**：使用 `app.graph.graph.app_graph` 执行请求路由，CoT 推理在 `router_node` 中完成。
 3. **子代理注册**：所有子代理需继承 `SubAgentBase` 并实现 `can_handle()` 与 `handle()` 方法。
 4. **配置优先级**：YAML 文件 → 环境变量（`APP_*`）→ 默认值。
@@ -161,3 +167,9 @@ curl -X POST http://localhost:8000/stt/transcribe \
    - **异步隔离**：使用 `asyncio.to_thread()` 将同步的 FunASR 推理丢到独立线程，不阻塞事件循环。
    - **格式兜底**：`_ensure_wav()` 通过 `soundfile` 将 mp3/webm 等转换为标准 16kHz mono WAV。
    - **前端集成**：`static/test_stream.html` 提供 🎤 录音按钮，Web Audio API 直出 PCM 并封装 WAV 上传。
+10. **错别字纠正服务**：`app/services/typo_service.py` 实现基于 macbert4csc-base-chinese 的中文纠错：
+   - **全局单例**：`get_typo_corrector()` 保证全应用共享一个模型实例。
+   - **异步隔离**：使用 `asyncio.to_thread()` 将同步推理丢到独立线程。
+   - **配置开关**：`preprocess.enable_typo_correction` 控制是否启用，关闭时跳过纠错步骤。
+   - **状态保留**：纠错后原文存入 `original_message`，纠正后文本存入 `message`，供后续节点和 LLM 使用。
+   - **配置**：`preprocess.typo_model` 指定模型名，默认 `shibing624/macbert4csc-base-chinese`。
