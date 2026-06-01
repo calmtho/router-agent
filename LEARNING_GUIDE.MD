@@ -67,7 +67,10 @@
 
 ```
 首次对话 → generate_title() → 5~15字标题 → 存入 _session_titles → 不再更新
-对话超阈值 → generate_summary() → 压缩旧历史 → 存入 _session_summaries → 增量更新
+每轮对话 → append_history() → turn 计数器 +1 → 消息带 turn 号
+对话超阈值 → needs_summary() 读 turn 计数器 → generate_summary() → 压缩旧历史 → 存入 _session_summaries → 增量更新
+滑动窗口 → get_history() → 按 turn 号取最近 N 轮
+历史裁剪 → generate_summary() → 按 turn > cutoff_turn 过滤
 Chat Agent 构建上下文 → 标题(【会话主题】) + 摘要(【历史摘要】) + 历史窗口 + 当前消息
 ```
 

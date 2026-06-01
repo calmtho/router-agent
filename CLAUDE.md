@@ -159,7 +159,8 @@ curl -X POST http://localhost:8000/stt/transcribe \
 8. **会话上下文管理**：`app/services/history_service.py` 实现双层摘要机制：
    - **标题摘要**：首次对话后异步生成（5~15 字），用于 UI 展示和会话标识，生成一次后不再更新。
    - **滚动摘要**：对话超过阈值（默认 10 轮）时异步生成，压缩旧历史节省 token，每次超阈值时增量更新。
-   - 两者独立存储（`_session_titles` / `_session_summaries`），互不影响，`clear_history()` 同时清理。
+   - **Turn 计数器**：每会话维护递增 turn 号（`_session_turn_counter`），每轮 user/assistant 消息共享同一 turn 号，消息带 `"turn": N` 字段。`needs_summary()` 直接读计数器，窗口和裁剪按 turn 号操作，不再用 `len(history) // 2` 推算。
+   - 三者独立存储（`_session_titles` / `_session_summaries` / `_session_turn_counter`），互不影响，`clear_history()` 同时清理。
    - 注入上下文时：标题以 `【会话主题】` 前缀注入，滚动摘要以 `【历史摘要】` 前缀注入。
 9. **STT 语音转写服务**：`app/services/stt_service.py` 实现基于 FunASR Paraformer-zh 的本地语音识别：
    - **lifespan 预加载**：模型在 `app.main: lifespan` 启动时加载，避免首次请求等待。

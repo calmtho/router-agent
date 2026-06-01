@@ -15,6 +15,9 @@ _session_summaries: Dict[str, str] = {}
 # 标题存储：session_id -> 会话标题（用于 UI 展示）
 _session_titles: Dict[str, str] = {}
 
+# 轮次计数器：session_id -> 当前轮次号（每会话递增，取代 %2 推算）
+_session_turn_counter: Dict[str, int] = {}
+
 
 def get_history(session_id: str, window: int = 10) -> List[dict]:
     """获取最近 N 轮对话历史
@@ -24,14 +27,22 @@ def get_history(session_id: str, window: int = 10) -> List[dict]:
         window: 窗口大小，返回最近多少轮
 
     Returns:
-        对话历史列表，格式：[{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+        对话历史列表，格式：[{"role": "user", "content": "...", "turn": N}, ...]
     """
     if session_id not in _session_history:
         return []
 
     history = _session_history[session_id]
-    # 返回最近 window * 2 条消息（每轮 2 条：user + assistant）
-    return history[-(window * 2):]
+    if not history:
+        return []
+
+    # 按 turn 号取最近 window 轮
+    all_turns = sorted(set(m.get("turn", 0) for m in history))
+    if not all_turns:
+        return []
+
+    recent_turns = set(all_turns[-window:])
+    return [m for m in history if m.get("turn", 0) in recent_turns]
 
 
 def append_history(session_id: str, user_msg: str, assistant_msg: str) -> None:
@@ -44,10 +55,14 @@ def append_history(session_id: str, user_msg: str, assistant_msg: str) -> None:
     """
     if session_id not in _session_history:
         _session_history[session_id] = []
+        _session_turn_counter[session_id] = 0
+
+    turn = _session_turn_counter[session_id] + 1
+    _session_turn_counter[session_id] = turn
 
     _session_history[session_id].extend([
-        {"role": "user", "content": user_msg},
-        {"role": "assistant", "content": assistant_msg},
+        {"role": "user", "content": user_msg, "turn": turn},
+        {"role": "assistant", "content": assistant_msg, "turn": turn},
     ])
 
 
@@ -79,6 +94,8 @@ def clear_history(session_id: str) -> bool:
         del _session_summaries[session_id]
     if session_id in _session_titles:
         del _session_titles[session_id]
+    if session_id in _session_turn_counter:
+        del _session_turn_counter[session_id]
     return True
 
 
@@ -88,8 +105,8 @@ def get_session_count() -> int:
 
 
 def get_all_sessions() -> Dict[str, int]:
-    """获取所有会话的历史长度（用于调试）"""
-    return {sid: len(history) for sid, history in _session_history.items()}
+    """获取所有会话的轮次号（用于调试）"""
+    return {sid: _session_turn_counter.get(sid, 0) for sid in _session_history}
 
 
 # 摘要生成锁，避免并发更新
@@ -113,13 +130,7 @@ def needs_summary(session_id: str, threshold: int = 10) -> bool:
     Returns:
         True 需要摘要，False 不需要
     """
-    if session_id not in _session_history:
-        return False
-
-    history = _session_history[session_id]
-    # 轮数 = 消息数 / 2
-    rounds = len(history) // 2
-    return rounds > threshold
+    return _session_turn_counter.get(session_id, 0) > threshold
 
 
 async def generate_summary(session_id: str, conversation_history: List[dict] = None, keep_rounds: int = 10) -> str:
@@ -138,16 +149,16 @@ async def generate_summary(session_id: str, conversation_history: List[dict] = N
     async with lock:
         # 使用传入的历史或内存中的历史
         history = conversation_history if conversation_history is not None else _session_history.get(session_id, [])
-        rounds = len(history) // 2
+        current_turn = _session_turn_counter.get(session_id, 0)
 
         # 未超过保留轮数，不需要摘要
-        if rounds <= keep_rounds:
+        if current_turn <= keep_rounds:
             return _session_summaries.get(session_id, "")
 
         try:
-            # 需要摘要的旧对话（前 rounds - keep_rounds 轮）
-            old_msg_count = (rounds - keep_rounds) * 2
-            old_history = history[:old_msg_count]
+            # 按 turn 号分界：需要摘要的旧对话（turn ≤ cutoff）
+            cutoff_turn = current_turn - keep_rounds
+            old_history = [m for m in history if 0 < m.get("turn", 0) <= cutoff_turn]
 
             # 获取已有的旧摘要，追加到摘要 prompt 中
             existing_summary = _session_summaries.get(session_id, "")
@@ -182,11 +193,14 @@ async def generate_summary(session_id: str, conversation_history: List[dict] = N
             # 覆盖旧摘要
             set_summary(session_id, summary)
 
-            # 裁剪历史，只保留最近 keep_rounds 轮
+            # 裁剪历史，只保留 turn > cutoff_turn 的消息
             if session_id in _session_history:
-                _session_history[session_id] = _session_history[session_id][-keep_rounds * 2:]
+                _session_history[session_id] = [
+                    m for m in _session_history[session_id]
+                    if m.get("turn", 0) > cutoff_turn
+                ]
 
-            logger.info(f"Summary generated for session {session_id}: {summary[:50]}..., history trimmed to {keep_rounds} rounds")
+            logger.info(f"Summary generated for session {session_id}: {summary[:50]}..., history trimmed to keep turns > {cutoff_turn}")
 
             return summary
 

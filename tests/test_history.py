@@ -14,6 +14,7 @@ from app.services.history_service import (
     _session_history,
     _session_summaries,
     _session_titles,
+    _session_turn_counter,
 )
 
 
@@ -23,10 +24,12 @@ def clean_state():
     _session_history.clear()
     _session_summaries.clear()
     _session_titles.clear()
+    _session_turn_counter.clear()
     yield
     _session_history.clear()
     _session_summaries.clear()
     _session_titles.clear()
+    _session_turn_counter.clear()
 
 
 SESSION_ID = "test-session"

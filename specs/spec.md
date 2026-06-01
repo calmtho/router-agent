@@ -199,6 +199,7 @@
 |------|---------|------|------|---------|------|
 | 标题摘要 | 首次对话后（异步） | UI 展示、会话标识 | 5~15 字 | 生成一次，不再更新 | `_session_titles` |
 | 滚动摘要 | 对话超阈值（默认 10 轮，异步） | 上下文窗口管理，压缩旧历史 | 50~200 字 | 每次超阈值增量更新 | `_session_summaries` |
+| turn 计数器 | 每轮对话时递增 | 精确追踪对话轮数，驱动窗口/裁剪 | — | 随对话持续递增 | `_session_turn_counter` |
 
 - **标题摘要 (`generate_title`)**:
   1. 首次对话结束后异步触发（`chat.py` 中 `asyncio.create_task`）
@@ -214,6 +215,15 @@
   4. 生成后裁剪历史，只保留最近 `keep_rounds` 轮
   5. 以 `【历史摘要】\n{summary}` 注入 LLM 上下文
 
+- **Turn 计数器机制**:
+  - 每个会话维护一个递增的 `turn` 号，存储在 `_session_turn_counter[sid]`
+  - `append_history()` 时 turn +1，同一轮的 user 和 assistant 消息共享同一 turn 号
+  - 每条消息带 `"turn": N` 字段（内部字段，不暴露给前端/API）
+  - `needs_summary()` 直接读 `_session_turn_counter` 判断轮数，不再用 `len(history) // 2`
+  - 滑动窗口（`get_history`）按 turn 号集合取最近 window 轮，不再用 `[-window * 2:]`
+  - 历史裁剪按 `turn > cutoff_turn` 过滤，不再用条数索引
+  - `clear_history()` 同时清理 `_session_turn_counter`
+
 - **上下文注入顺序**（`chat_agent.py`）:
   ```
   System: 你是一个友好、专业的 AI 助手...
@@ -223,7 +233,7 @@
   User: (当前消息)
   ```
 
-- **清理**: `clear_history()` 同时清理标题、摘要和历史
+- **清理**: `clear_history()` 同时清理标题、摘要、turn 计数器和历史
 
 ### 2.11 STT 语音转写服务
 
