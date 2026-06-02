@@ -3,6 +3,7 @@ stt_service.py — FunASR 语音转文字服务（封装 Paraformer-zh 模型）
 """
 
 import asyncio
+import re
 import tempfile
 from pathlib import Path
 
@@ -32,6 +33,8 @@ class STTService:
         try:
             self._model = AutoModel(
                 model="paraformer-zh",
+                vad_model="fsmn-vad",    # 语音活动检测（长音频自动切分）
+                punc_model="ct-punc",    # 标点恢复（同时消除多余空格）
                 disable_update=True,
                 hub="ms",
             )
@@ -105,6 +108,8 @@ class STTService:
         text = ""
         if result and len(result) > 0:
             text = result[0].get("text", "").strip()
+            # 去除中文字符之间的多余空格（英文单词间保留空格）
+            text = re.sub(r'(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])', '', text)
 
         return {
             "text": text,
