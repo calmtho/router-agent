@@ -1,6 +1,7 @@
 """对话历史服务 - 内存版实现"""
 
 import asyncio
+import re
 from typing import Dict, List
 
 from app.services.llm_client import get_llm_client
@@ -183,6 +184,9 @@ async def generate_summary(session_id: str, conversation_history: List[dict] = N
 
             summary = await get_llm_client().chat(messages)
 
+            # 移除 <think>...</think> 推理标签（DeepSeek-R1 等模型可能输出）
+            summary = re.sub(r'<think>.*?</think>', '', summary, flags=re.DOTALL).strip()
+
             # 清理摘要（移除可能的引号、前缀等）
             summary = summary.strip().strip('"').strip('\u201c').strip('\u201d').strip()
 
@@ -243,6 +247,9 @@ async def generate_title(session_id: str) -> str:
         ]
 
         title = await get_llm_client().chat(messages)
+
+        # 移除 <think>...</think> 推理标签
+        title = re.sub(r'<think>.*?</think>', '', title, flags=re.DOTALL).strip()
 
         # 清理推理泄漏：LLM 可能输出 "用户需要...标题：关于AI" 之类的推理过程
         # 尝试从分隔符后提取真正标题

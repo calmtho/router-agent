@@ -4,6 +4,7 @@ from app.config import config
 from app.services.history_service import append_history, get_summary
 from app.services.llm_client import get_llm_client
 from app.services.milvus_service import milvus_service
+from app.services.reranker_service import get_reranker_service
 from app.utils.logger import logger
 
 
@@ -16,7 +17,7 @@ class RAGChain:
     async def run(self, query: str, session_id: str | None = None, file_ids: list[str] | None = None, chat_history: list[dict] | None = None) -> dict[str, Any]:
         """执行 RAG 检索和生成"""
 
-        # 从 Milvus 检索相关文档
+        # 从 Milvus 检索相关文档（召回阶段）
         retrieved_docs = await milvus_service.search(query, session_id, top_k=self.top_k, file_ids=file_ids)
 
         if not retrieved_docs:
@@ -25,6 +26,7 @@ class RAGChain:
                 "answer": "抱歉，我没有找到相关的文档内容来回答您的问题。",
                 "sources": [],
                 "answer_from": "no_docs",
+                "rerank_used": False,
             }
             # 仍然保存对话历史（虽然没有用到文档）
             if session_id and chat_history:
@@ -34,8 +36,12 @@ class RAGChain:
         # 获取摘要
         summary = get_summary(session_id) if session_id else ""
 
-        # 构建上下文
-        context = "\n\n".join([f"[来源{i+1}] {doc['text']}" for i, doc in enumerate(retrieved_docs)])
+        # 阶段 2: 对检索结果进行重排序（如果启用）
+        reranker = get_reranker_service()
+        reranked_docs, rerank_used = await reranker.rerank(query, retrieved_docs)
+
+        # 构建上下文（使用重排序后的结果）
+        context = "\n\n".join([f"[来源{i+1}] {doc['text']}" for i, doc in enumerate(reranked_docs)])
 
         # 构建 RAG Prompt，包含摘要
         prompt = "请根据以下文档内容回答用户的问题，如果文档中没有相关信息，请如实告知。"
@@ -60,8 +66,9 @@ class RAGChain:
 
             result = {
                 "answer": answer,
-                "sources": [{"text": doc["text"], "score": doc["score"]} for doc in retrieved_docs],
+                "sources": [{"text": doc["text"], "score": doc["score"], "rerank_score": doc.get("rerank_score")} for doc in reranked_docs],
                 "answer_from": "rag",
+                "rerank_used": rerank_used,
             }
 
             # 保存对话历史
@@ -74,8 +81,9 @@ class RAGChain:
             logger.error(f"RAG chain failed: {e}")
             error_result = {
                 "answer": "抱歉，在生成回答时遇到了问题，请稍后重试。",
-                "sources": retrieved_docs,
+                "sources": reranked_docs,
                 "answer_from": "generation_failed",
+                "rerank_used": rerank_used,
             }
             # 仍然保存对话历史
             if session_id and chat_history:

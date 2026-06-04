@@ -5,7 +5,7 @@
 2. **错别字纠正**：预处理管道第一步，基于 macbert4csc 自动纠正中文错别字，纠正后保留原文到 `original_message`。
 3. **内容安全过滤**：预处理管道第二步，检测并拦截包含敏感词的用户请求，防止不当内容进入系统。
 4. **MCP 工具调用**：子代理遵循 Model Context Protocol 调用外部工具。MCP Server 通过 stdio 子进程启动，支持计算器、网页抓取等工具。自定义 Server 可放在 `app/mcp_servers/` 目录下，在 `config.yaml` 中注册即可。
-5. **RAG 增强生成**：子代理基于 Milvus 向量库进行检索增强，支持文件上传与文档问答。
+5. **RAG 增强生成**：子代理基于 Milvus 向量库进行两阶段检索增强（Milvus 粗排 + Cross-Encoder 精排），支持文件上传与文档问答。
 6. **自由闲聊**：子代理提供通用对话能力。
 7. **会话上下文管理**：双层摘要机制——标题摘要（首次对话生成，用于 UI 展示）+ 滚动摘要（超阈值触发，用于上下文窗口管理），历史自动裁剪。
 8. **可观测性**：集成 Langfuse 进行 LLM 调用链路追踪，支持 Trace、Span、Generation 等多种观测类型。
@@ -30,6 +30,7 @@
 | 异步支持 | asyncio + httpx |
 | 错别字纠正 | macbert4csc-base-chinese (transformers + torch) |
 | 语音识别 | FunASR (Paraformer-zh) + soundfile + ModelScope |
+| 重排序模型 | sentence-transformers Cross-Encoder (cross-encoder/ms-marco-MiniLM-L12-v2) |
 | 测试框架 | pytest + pytest-asyncio |
 
 # 项目结构
@@ -65,6 +66,7 @@
 │   │   ├── history_service.py  # 对话历史管理（标题/摘要生成、滑动窗口、历史裁剪）
 │   │   ├── llm_client.py       # LLM 客户端 + 本地 Embedding
 │   │   ├── stt_service.py      # STT 语音转写服务（FunASR Paraformer-zh 封装）
+│   │   ├── reranker_service.py # 检索结果重排序（Cross-Encoder 精排）
 │   │   └── typo_service.py     # 错别字纠正服务（macbert4csc 封装）
 │   ├── mcp_servers/            # MCP 工具服务器
 │   │   └── calculator_server.py # 计算器工具示例
@@ -87,6 +89,7 @@
 │   ├── test_paddle.py          # PaddleOCR API 集成测试
 │   ├── test_stt_local.py       # FunASR 语音转写本地测试
 │   ├── test_preprocess.py       # 预处理管道测试（错字纠正 + 敏感词过滤）
+│   ├── test_reranker.py         # 重排序功能测试
 │   └── test_imports.py          # 模块导入检查
 ├── requirements.txt
 ├── Dockerfile
@@ -130,7 +133,7 @@ python tests/test_paddle.py
 python tests/test_stt_local.py
 ```
 
-6. 测试接口：
+7. 测试接口：
 ```bash
 # 先上传文件
 curl -X POST http://localhost:8000/upload \
@@ -174,3 +177,9 @@ curl -X POST http://localhost:8000/stt/transcribe \
    - **配置开关**：`preprocess.enable_typo_correction` 控制是否启用，关闭时跳过纠错步骤。
    - **状态保留**：纠错后原文存入 `original_message`，纠正后文本存入 `message`，供后续节点和 LLM 使用。
    - **配置**：`preprocess.typo_model` 指定模型名，默认 `shibing624/macbert4csc-base-chinese`。
+11. **重排序服务**：`app/services/reranker_service.py` 实现基于 Cross-Encoder 的两阶段检索精排：
+   - **全局单例**：`get_reranker_service()` 保证全应用共享一个模型实例。
+   - **异步隔离**：使用 `asyncio.to_thread()` 将同步推理丢到独立线程，不阻塞事件循环。
+   - **配置开关**：`rag.rerank_enabled` 控制是否启用，关闭时跳过重排序，直接使用原始检索结果。
+   - **降级策略**：模型加载失败时自动降级为原始检索结果，不中断流程。
+   - **配置**：`rag.rerank_model` 指定模型名，默认 `cross-encoder/ms-marco-MiniLM-L12-v2`；`rag.rerank_batch_size` 控制批处理大小；`rag.rerank_output_k` 控制精排后输出数量。

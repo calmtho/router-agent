@@ -1,10 +1,15 @@
 """中文错别字纠正服务 —— 基于 macbert4csc-base-chinese 直接推理"""
 
 import asyncio
+import re
 
 import torch
 
 from app.utils.logger import logger
+
+# 检测文本中是否包含"真英文"的正则
+# 全大写缩写：LLM, API; 首字母大写：Agent, Python; 驼峰：macOS, iPhone
+_REAL_ENGLISH_PATTERN = re.compile(r'\b[A-Z]{2,}\b|\b[A-Z][a-z]+\b|[a-z]+[A-Z]\w*')
 
 
 class TypoCorrector:
@@ -41,9 +46,19 @@ class TypoCorrector:
             logger.error(f"[Typo] 纠错模型加载失败: {e}")
             return False
 
+    @staticmethod
+    def _has_real_english(text: str) -> bool:
+        """检测是否包含真正的英文（非拼音/无意义小写）"""
+        return bool(_REAL_ENGLISH_PATTERN.search(text))
+
     async def correct(self, text: str) -> tuple[str, list]:
         """纠正中文错别字，返回 (纠正后文本, [(错字, 正字, 位置), ...])"""
         if not self.is_ready or not text.strip():
+            return text, []
+
+        # 如果包含大写缩写/驼峰等真英文，跳过纠错
+        if self._has_real_english(text):
+            logger.debug(f"[Typo] 检测到英文，跳过纠错: {text!r}")
             return text, []
 
         def _infer():

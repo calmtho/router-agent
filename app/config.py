@@ -41,6 +41,10 @@ class RAGConfig(BaseModel):
     chunk_size: int = 500
     chunk_overlap: int = 100
     top_k: int = 4
+    rerank_enabled: bool = True
+    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L12-v2"
+    rerank_batch_size: int = 4
+    rerank_output_k: int = 4
 
 
 class PaddleOCRConfig(BaseModel):

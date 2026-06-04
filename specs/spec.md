@@ -21,6 +21,12 @@
                      │             │
               ┌──────▼──────┐      │
               │Milvus 向量库 │      │
+              │ (粗排 top_k) │      │
+              └──────┬──────┘      │
+                     │             │
+              ┌──────▼──────┐      │
+              │  Reranker   │      │
+              │ (精排 top_n) │      │
               └──────┬──────┘      │
                      │             │
               ┌──────▼──────┐      │
@@ -129,9 +135,11 @@
 - **流程**:
   1. 用户先通过 `/upload` 上传文件，文件被分块、向量化后存入 Milvus
   2. 用户通过 `/chat` 发送 query 并附带 `file_ids`
-  3. RAG Agent 在 Milvus 中检索相关文档块
-  4. 拼接检索结果作为上下文，由 LLM 生成最终回答
-- **回退**: 检索为空时回退为生成式回答
+  3. RAG Agent 在 Milvus 中检索相关文档块（粗排，默认 `top_k=16`）
+  4. Cross-Encoder 重排序模型对候选文档块进行精排（按相关性重新打分排序）
+  5. 取精排后 top `rerank_output_k` 个最优结果（默认 4 个）
+  6. 拼接精排结果作为上下文，由 LLM 生成最终回答
+- **回退**: 检索为空时回退为生成式回答；重排序模型加载失败时自动降级，使用原始检索结果
 
 > ⚠️ **架构说明 — 当前实现为简化演示**
 >
@@ -144,6 +152,26 @@
 > | 短文档即时问答 | **VLM + LLM 直接阅读** | 将文档页面截图或转 Markdown 后直接送入 LLM（如 GPT-4o-mini、Qwen-VL），无需切片和检索，延迟低、保真度高 |
 > | 长文档/跨文档检索 | **RAG 流水线** | 文档超出 LLM 上下文窗口或需要跨文档语义检索时，才需要 chunk → embedding → vector DB → retrieve 的完整流程 |
 > | 长期外挂知识库 | **RAG + 独立索引服务** | 知识需要持续更新、多用户共享时，upload 和 chunk/index 应拆为独立服务（upload 低延迟、限流；index 计算密集、可批量/GPU 加速、独立扩缩容） |
+
+### 2.5.1 Reranker 重排序服务
+
+- **文件**: `app/services/reranker_service.py`
+- **模型**: `cross-encoder/ms-marco-MiniLM-L12-v2`（sentence-transformers Cross-Encoder）
+- **依赖**: `sentence-transformers>=2.7.0`
+- **架构特点**:
+  - `get_reranker_service()` 全局单例，全应用共享一个模型实例
+  - 线程锁（`_lock`）防止并发加载
+  - `asyncio.to_thread()` 包装同步推理，不阻塞事件循环
+  - 模型加载失败时自动降级为原始检索结果，不中断流程
+- **输入/输出**: `rerank(query, documents) -> [(document, score), ...]`，按相关性降序
+- **配置**:
+  ```yaml
+  rag:
+    rerank_enabled: true                      # 是否启用重排序
+    rerank_model: "cross-encoder/ms-marco-MiniLM-L12-v2"  # 重排序模型
+    rerank_batch_size: 4                      # 批处理大小
+    rerank_output_k: 4                        # 精排后输出数量
+  ```
 
 ### 2.6 MCP Agent（工具调用代理）
 
@@ -386,7 +414,11 @@ mcp:                          # MCP 工具服务器
 rag:                          # RAG 参数
   chunk_size: 500             # 文档分块大小
   chunk_overlap: 50           # 分块重叠
-  top_k: 4                    # 检索返回数
+  top_k: 16                   # 粗排召回候选数量
+  rerank_enabled: true        # 是否启用重排序
+  rerank_model: "cross-encoder/ms-marco-MiniLM-L12-v2"  # 重排序模型
+  rerank_batch_size: 4        # 批处理大小
+  rerank_output_k: 4          # 精排后输出数量
 
 paddle_ocr:                   # 飞桨 PaddleOCR 云端 OCR
   endpoint: "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"

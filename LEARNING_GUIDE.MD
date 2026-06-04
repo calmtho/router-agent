@@ -60,6 +60,7 @@
 | app/services/milvus_service.py | 向量服务 | Milvus 检索 + LangChain vectorstore |
 | app/services/mcp_client.py | MCP 客户端 | stdio 子进程通信、mcp SDK |
 | app/services/typo_service.py | 错别字纠正 | macbert4csc 单例、asyncio.to_thread 异步推理 |
+| app/services/reranker_service.py | 重排序服务 | Cross-Encoder 模型加载、rerank() 接口、降级策略 |
 | app/services/history_service.py | 对话历史管理 | 标题摘要 / 滚动摘要双层机制、滑动窗口、历史裁剪 |
 | app/chains/rag_chain.py | RAG 链 | 检索 + 生成的完整流程 |
 
@@ -133,6 +134,7 @@ configs/config.yaml
 → app/agents/rag_agent.py
 → app/services/llm_client.py
 → app/services/milvus_service.py
+→ app/services/reranker_service.py
 → app/services/history_service.py
 → app/services/typo_service.py
 → app/routers/chat.py
