@@ -12,7 +12,9 @@ class AgentState(TypedDict, total=False):
     message: str                    # 用户消息（可能经过错字纠正）
     original_message: Optional[str]  # 用户原始输入（未经处理）
     session_id: str                # 会话 ID
-    file_ids: Optional[list[str]]  # 引用的文件 IDs
+    file_ids: Optional[list[str]]  # 引用的文件 IDs（文档类，用于 RAG）
+    image_ids: Optional[list[str]] # 引用的图片 IDs（图片类，用于 Vision）
+    image_paths: Optional[list[str]]  # 图片文件路径（由 image_ids 解析得到）
     chat_history: list[dict]       # 聊天历史（最近 N 轮）
 
     # 路由结果

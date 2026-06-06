@@ -3,31 +3,32 @@
 ## 1. 系统架构
 
 ```
-┌─────────────────────────────────────────────────┐
-│                   FastAPI 入口                     │
-│        /chat (POST)  /upload (POST)  /stt/transcribe (POST) │
-└──────────────────────┬──────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                   FastAPI 入口                               │
+│  /chat (POST)  /upload (POST)  /upload/image (POST)         │
+│  /stt/transcribe (POST)                                      │
+└──────────────────────┬──────────────────────────────────────┘
                        │
               ┌────────▼────────┐
               │ Preprocess Node  │
-              │(错字纠正→敏感词)  │
-              └───┬───┬───┬─────┘
-                  │   │   │
-         ┌────────┘   │   └────────┐
-         ▼            ▼            ▼
-   ┌──────────┐ ┌──────────┐ ┌──────────┐
-   │Chat Node │ │RAG Node  │ │MCP Node  │
-   └──────────┘ └────┬─────┘ └────┬─────┘
-                     │             │
-              ┌──────▼──────┐      │
-              │Milvus 向量库 │      │
-              │ (粗排 top_k) │      │
-              └──────┬──────┘      │
-                     │             │
-              ┌──────▼──────┐      │
-              │  Reranker   │      │
-              │ (精排 top_n) │      │
-              └──────┬──────┘      │
+              │(错字纠正→敏感词→图片路径解析)│
+              └──┬──┬──┬──┬─────┘
+                 │  │  │  │
+        ┌────────┘  │  │  └────────┐
+        ▼           ▼  ▼           ▼
+  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+  │Chat Node │ │RAG Node  │ │MCP Node  │ │Vision Node│
+  └──────────┘ └────┬─────┘ └────┬─────┘ └─────┬────┘
+                     │             │              │
+              ┌──────▼──────┐      │         ┌────▼─────┐
+              │Milvus 向量库 │      │         │ VL 模型   │
+              │ (粗排 top_k) │      │         │(特征提取) │
+              └──────┬──────┘      │         └────┬─────┘
+                     │             │              │
+              ┌──────▼──────┐      │         ┌────▼─────┐
+              │  Reranker   │      │         │ 文本 LLM  │
+              │ (精排 top_n) │      │         │(自检+回答)│
+              └──────┬──────┘      │         └──────────┘
                      │             │
               ┌──────▼──────┐      │
               │HuggingFace  │      │
@@ -48,6 +49,16 @@
 2. 后台异步执行：解析文本 → 切片 → 向量化 → 写入 Milvus
 3. 前端轮询 `/upload/status/{file_id}`，处理完成获得 status: ready
 4. 用户发送消息并附带 `file_ids` → Router 路由到 RAG Agent → Milvus 检索相关 chunk → LLM 生成回答
+
+### 1.2 图片上传交互流程
+
+用户通过 `/upload/image` 上传图片后，系统采用「同步返回 + Session Context 继承」模式：
+
+1. 用户上传图片 → 服务端立即返回 `image_id`、文件名、文件大小
+2. 图片保存在 `uploads/images/` 目录，元信息持久化到 `.registry.json`
+3. 用户发送消息并附带 `image_ids` → Preprocess 解析图片路径 → Router 优先路由到 Vision Agent
+4. Vision Agent 执行 4 阶段处理（VL 特征提取 → LLM 自检 → 补偿轮 → LLM 回答）
+5. Session Context 自动继承 image_ids，后续对话无需重复指定
 
 > 该流程将 upload（用户侧，低延迟）与 chunk/index（计算密集）合在同一服务中，仅为简化演示。
 > 生产环境建议拆分为独立的 upload 服务和 index 服务，详见 2.1 节。
@@ -75,10 +86,11 @@
 ### 2.2 Preprocess Node（预处理节点）
 
 - **文件**: `app/graph/nodes.py`
-- **职责**: 错别字纠正 → 敏感内容过滤（两步串行管道）
+- **职责**: 错别字纠正 → 敏感内容过滤 → 图片路径解析（三步串行管道）
 - **处理流程**:
   1. **错别字纠正**（可配置开关 `preprocess.enable_typo_correction`）：调用 `TypoCorrector` 对用户输入进行纠错，纠正后文本存入 `message`，原始输入存入 `original_message`
   2. **敏感词过滤**：检测用户输入是否包含敏感词，检测到则直接拒绝返回提示
+  3. **图片路径解析**：将请求中的 `image_ids` 解析为实际文件路径，存入 `image_paths`，供 Vision Agent 使用
 - **敏感词词典**: `app/data/sensitive_words.py`
 - **检测方式**: 正则表达式匹配
 - **处理方式**: 检测到敏感词时直接拒绝，返回提示信息
@@ -113,8 +125,10 @@
 
 - **文件**: `app/graph/nodes.py`
 - **职责**: 通过 CoT Prompt 引导 LLM 推理，决策路由到哪个子代理
-- **输出格式**: `{"target": "rag|chat|mcp", "reasoning": "..."}`
+- **输出格式**: `{"target": "rag|chat|mcp|vision", "reasoning": "..."}`
+- **文件优先短路**: 请求携带 `file_ids` 时，跳过 CoT 推理，直接路由到 RAG Agent（省约 10s+）
 - **降级策略**: 目标代理执行失败时，回退至 `fallback_agent`（默认 `chat`）
+- **图片优先路由**: 当请求携带 `image_ids` 时，CoT Prompt 追加提示优先考虑 vision 子代理
 
 ### 2.4 Chat Agent（闲聊代理）
 
@@ -160,6 +174,7 @@
 - **依赖**: `sentence-transformers>=2.7.0`
 - **架构特点**:
   - `get_reranker_service()` 全局单例，全应用共享一个模型实例
+  - lifespan 预加载：模型在服务启动时预加载，避免首次 RAG 请求等待约 11s
   - 线程锁（`_lock`）防止并发加载
   - `asyncio.to_thread()` 包装同步推理，不阻塞事件循环
   - 模型加载失败时自动降级为原始检索结果，不中断流程
@@ -276,6 +291,54 @@
   - `asyncio.to_thread()` 包装同步推理，不阻塞事件循环
 - **前端集成**: `static/test_stream.html` 通过 Web Audio API 直出 PCM 并手动封装 WAV，保证标准格式
 
+### 2.12 Vision Agent（图片理解代理）
+
+- **文件**: `app/agents/vision_agent.py`
+- **职责**: 基于小 VL + 大 LLM 模式的图片理解问答
+- **架构（4 阶段，两模型职责分离）**:
+  1. **Phase 1 — VL 结构化特征提取**：VL 模型根据用户问题从图片提取结构化特征（JSON），包含 `features`、`scene_description`、`text_content`、`objects` 字段
+  2. **Phase 2 — LLM 自检**：文本 LLM 检查提取的特征是否足以回答用户问题，输出 `sufficient`/`missing_info`/`reason`
+  3. **Phase 3 — 补偿轮（可选）**：自检结果为 `insufficient` 时，VL 模型根据缺失信息定向补充提取 `additional_features`，合并到已有特征中
+  4. **Phase 4 — LLM 回答**：文本 LLM 基于特征生成自然语言回答，要求不臆测图片中不存在的内容
+- **模型选择**：配置问题，架构保持职责分离——VL 负责视觉感知→结构化特征，文本 LLM 负责推理检查+最终回答
+- **降级策略**：无图片时返回提示"请先上传图片"；处理异常时返回错误提示
+- **流式支持**：`handle_stream()` 暂不支持流式 VL，回退到非流式一次性输出
+- **JSON 解析兼容**：`_try_parse_json()` 支持直接解析、````json```代码块提取、`{...}`花括号提取三种方式
+- **配置**:
+  ```yaml
+  vision:
+    openai_base_url: "${VL_BASE_URL}"
+    api_key: "${VL_API_KEY}"
+    model_name: "${VL_MODEL_NAME}"
+    temperature: 0.1
+    max_tokens: 2048
+  ```
+
+### 2.13 VL 多模态客户端
+
+- **文件**: `app/services/vl_client.py`
+- **模型**: 任何兼容 OpenAI API 格式的 VL 模型（Qwen2.5-VL、InternVL2、gpt-4o-mini 等）
+- **依赖**: `langchain-openai`（ChatOpenAI）
+- **架构特点**:
+  - `get_vl_client()` 全局单例，延迟初始化
+  - 图片通过 Base64 data URI 编码后放入 `HumanMessage.content` 多模态数组
+  - 支持图片格式：jpg、jpeg、png、webp、gif、bmp
+  - 编码失败时降级为文本占位 `[图片加载失败: path]`
+- **接口**: `analyze(prompt, image_paths) -> str`：发送提示词+图片列表，返回 VL 模型文本响应
+- **配置**: 从 `config.vision` 读取 `openai_base_url`/`api_key`/`model_name`/`temperature`/`max_tokens`
+
+### 2.14 Session Context 服务
+
+- **文件**: `app/services/session_context_service.py`
+- **职责**: 为每个会话维护上下文包，自动继承上一轮用到的图片 ID
+- **核心功能**:
+  - **图片 ID 继承**：Chat 请求未传 `image_ids` 时，自动继承同 session 上一轮的图片 ID，支持多轮连续问答
+  - **TTL 过期清理**：默认 30 分钟，超时后 `get_recent_image_ids()` 返回空列表
+  - **去重合并**：多轮图片 ID 按顺序去重合并，避免重复
+  - **显式清除**：`clear_image_ids()` 清除指定会话的图片 ID；`clear_context()` 清除整个上下文包
+- **存储**：内存存储（`_session_context` 字典），服务重启后清空
+- **调试**：`get_context_stats()` 返回各会话的图片 ID 数量
+
 ## 3. API 接口
 
 ### 3.1 POST /upload
@@ -334,6 +397,7 @@
 | `message` | string | 用户消息 |
 | `session_id` | string | 会话标识（可选） |
 | `file_ids` | string[] | 引用已上传文件的 ID 列表（可选） |
+| `image_ids` | string[] | 引用已上传图片的 ID 列表（可选，未传时自动继承 Session Context） |
 
 **响应**:
 ```json
@@ -376,6 +440,46 @@
 ```
 
 **前端集成**: 前端通过 Web Audio API 录制 16kHz mono WAV，以 FormData 上传。
+
+### 3.7 POST /upload/image
+
+上传图片文件，返回 `image_id` 用于后续 Chat 请求引用。
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `file` | UploadFile | 要上传的图片（支持 jpg/jpeg/png/webp/gif/bmp/tiff） |
+
+**响应**:
+```json
+{
+  "image_id": "a1b2c3d4e5f6",
+  "filename": "photo.jpg",
+  "size_bytes": 123456
+}
+```
+
+**处理流程**:
+1. 校验文件后缀是否为支持的图片格式
+2. 校验文件内容长度（至少 20 字节）
+3. 生成 `image_id`（UUID hex 前 12 位），保存图片到 `uploads/images/` 目录
+4. 注册图片元信息到 `uploads/images/.registry.json`（持久化，防止 reload 丢失）
+5. 返回 `image_id`、原始文件名和文件大小
+
+**持久化注册表**:
+- 图片元信息保存到 `uploads/images/.registry.json`
+- 服务启动时自动加载注册表，清理已不存在的文件记录
+- `resolve_image_paths(image_ids)` 函数将 image_ids 解析为文件路径列表
+
+**使用方式**:
+```bash
+# 上传图片
+curl -X POST http://localhost:8000/upload/image -F "file=@photo.jpg"
+
+# 在 Chat 请求中引用图片
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message":"这张图片里有什么？","image_ids":["<image_id>"]}'
+```
 
 ## 4. 配置文件
 
@@ -424,6 +528,13 @@ paddle_ocr:                   # 飞桨 PaddleOCR 云端 OCR
   endpoint: "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
   token: "${PADDLEOCR_ACCESS_TOKEN}"
   model: "PaddleOCR-VL-1.6"
+
+vision:                       # VL 多模态模型（图片理解）
+  openai_base_url: "${VL_BASE_URL}"   # VL 模型 API 地址
+  api_key: "${VL_API_KEY}"            # VL 模型 API 密钥
+  model_name: "${VL_MODEL_NAME}"      # VL 模型名称
+  temperature: 0.1                    # 温度参数
+  max_tokens: 2048                    # 最大输出 token
 
 main_agent:                   # 主代理配置（LangGraph 使用）
   cot_prompt_template: |      # CoT 推理提示模板
@@ -557,6 +668,7 @@ LANGFUSE_BASE_URL=https://cloud.langfuse.com
 | Chat Agent | `chat_agent` | `chat_agent` |
 | RAG Agent | `rag_agent` | `rag_agent` |
 | MCP Agent | `mcp_agent` | `mcp_agent` |
+| Vision Agent | `vision_agent` | `vision_agent` |
 | LangChain LLM 调用 | 自动创建 | `LLM` |
 
 ### 9.4 查看追踪数据

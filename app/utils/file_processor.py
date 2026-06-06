@@ -5,7 +5,7 @@ from pathlib import Path
 
 import httpx
 from docx import Document
-from langchain.text_splitter import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
 from app.config import config
 

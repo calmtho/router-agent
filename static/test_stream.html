@@ -349,7 +349,8 @@
                     • 实时显示推理过程（蓝色背景）<br>
                     • 实时显示回答内容<br>
                     • 底部显示代理类型和状态<br>
-                    • 📎 支持上传 PDF/TXT/MD/DOCX，后台异步分析，分析完成前自动锁定发送
+                    • 📎 支持上传 PDF/TXT/MD/DOCX，后台异步分析，分析完成前自动锁定发送<br>
+                    • 📎 支持上传 JPG/PNG/WEBP 图片，发送时附带图片进行视觉理解
                 </p>
             </div>
         </div>
@@ -370,7 +371,7 @@
                 </div>
             </div>
             <div class="input-area">
-                <input type="file" id="fileInput" accept=".pdf,.txt,.md,.docx,.doc">
+                <input type="file" id="fileInput" accept=".pdf,.txt,.md,.docx,.doc,.jpg,.jpeg,.png,.webp,.gif,.bmp,.tiff">
                 <button class="upload-btn" id="uploadBtn" title="上传文件">📎</button>
                 <button class="mic-btn" id="micBtn" title="语音输入">🎤</button>
                 <div class="input-wrapper">
@@ -402,7 +403,7 @@
         let startTime = 0;
         let currentReasoningDiv = null;
         let currentAnswerDiv = null;
-        let uploadedFiles = []; // [{ file_id, filename, tagId, status }]
+        let uploadedFiles = []; // [{ id, type: 'doc'|'image', filename, tagId, status }]
 
         // ── STT 语音输入相关变量（Web Audio API 直出 WAV）──
         let audioContext = null;
@@ -632,7 +633,7 @@
                             sysMsg.style.color = '#166534';
                         }
                         // 更新 uploadedFiles 状态
-                        const fileEntry = uploadedFiles.find(f => f.file_id === fileId);
+                        const fileEntry = uploadedFiles.find(f => f.id === fileId);
                         if (fileEntry) fileEntry.status = 'ready';
                         updateSendButton();
                         break;
@@ -650,7 +651,7 @@
                             sysMsg.style.background = '#fff5f5';
                             sysMsg.style.color = '#c53030';
                         }
-                        const fileEntry = uploadedFiles.find(f => f.file_id === fileId);
+                        const fileEntry = uploadedFiles.find(f => f.id === fileId);
                         if (fileEntry) fileEntry.status = 'error';
                         updateSendButton();
                         break;
@@ -667,6 +668,12 @@
         // 文件上传逻辑
         uploadBtn.addEventListener('click', () => fileInput.click());
 
+        function isImageExt(filename) {
+            const imgExts = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff'];
+            const ext = '.' + filename.split('.').pop().toLowerCase();
+            return imgExts.includes(ext);
+        }
+
         fileInput.addEventListener('change', async function() {
             const files = this.files;
             if (!files.length) return;
@@ -676,6 +683,7 @@
 
             for (const file of files) {
                 const tagId = 'file-tag-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+                const isImage = isImageExt(file.name);
 
                 // 先添加"上传中"标签
                 const tag = document.createElement('span');
@@ -688,9 +696,14 @@
                 try {
                     const formData = new FormData();
                     formData.append('file', file);
-                    formData.append('session_id', sessionId);
+                    if (!isImage) {
+                        formData.append('session_id', sessionId);
+                    }
 
-                    const res = await fetch(`${baseUrl}/upload`, {
+                    // ====== 图片走 /upload/image，文档走 /upload ======
+                    const uploadUrl = isImage ? `${baseUrl}/upload/image` : `${baseUrl}/upload`;
+
+                    const res = await fetch(uploadUrl, {
                         method: 'POST',
                         body: formData,
                     });
@@ -698,22 +711,27 @@
                     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
                     const result = await res.json();
-                    const fileId = result.file_id;
+                    const id = isImage ? result.image_id : result.file_id;
 
-                    // 后端返回 processing 状态，前端显示"正在分析"
-                    tag.className = 'file-tag processing';
-                    tag.innerHTML = `${escapeHtml(file.name)} <button class="remove-btn" onclick="removeFileTag('${tagId}', '${fileId}')">×</button>`;
+                    // 更新标签为"已就绪"
+                    tag.className = 'file-tag uploaded';
+                    tag.innerHTML = `${escapeHtml(file.name)} <button class="remove-btn" onclick="removeFileTag('${tagId}', '${id}')">×</button>`;
 
-                    // 加入 uploadedFiles 数组（状态为 processing）
-                    uploadedFiles.push({ file_id: fileId, filename: file.name, tagId, status: 'processing' });
+                    // 加入 uploadedFiles 数组
+                    uploadedFiles.push({ id, type: isImage ? 'image' : 'doc', filename: file.name, tagId, status: 'ready' });
                     updateSendButton();
 
-                    // 显示系统提示（带 ID，轮询完成后可更新）
-                    const sysMsgId = 'sys-msg-' + fileId;
-                    addMessage(`📎 ${escapeHtml(file.name)} 正在分析文件内容，请耐心等待`, 'system', null, sysMsgId);
-
-                    // 开始轮询状态
-                    pollFileStatus(fileId, tagId, sysMsgId, file.name);
+                    if (isImage) {
+                        addMessage(`🖼️ ${escapeHtml(file.name)} 已上传`, 'system');
+                    } else {
+                        // 文档显示系统提示并开始轮询
+                        const sysMsgId = 'sys-msg-' + id;
+                        addMessage(`📎 ${escapeHtml(file.name)} 正在分析文件内容，请耐心等待`, 'system', null, sysMsgId);
+                        // 加入时状态为 processing
+                        const entry = uploadedFiles.find(f => f.id === id);
+                        if (entry) entry.status = 'processing';
+                        pollFileStatus(id, tagId, sysMsgId, file.name);
+                    }
 
                 } catch (err) {
                     console.error('Upload error:', err);
@@ -726,11 +744,11 @@
             this.value = '';
         });
 
-        function removeFileTag(tagId, fileId) {
+        function removeFileTag(tagId, id) {
             const tag = document.getElementById(tagId);
             if (tag) tag.remove();
-            if (fileId) {
-                uploadedFiles = uploadedFiles.filter(f => f.file_id !== fileId);
+            if (id) {
+                uploadedFiles = uploadedFiles.filter(f => f.id !== id);
             }
             updateSendButton();
         }
@@ -742,8 +760,9 @@
             const baseUrl = baseUrlInput.value.replace(/\/+$/, '');
             const sessionId = sessionIdInput.value || 'default';
 
-            // 收集当前 file_ids
-            const currentFileIds = uploadedFiles.map(f => f.file_id);
+            // 收集当前文件 ID
+            const currentFileIds = uploadedFiles.filter(f => f.type === 'doc').map(f => f.id);
+            const currentImageIds = uploadedFiles.filter(f => f.type === 'image').map(f => f.id);
             const currentFileNames = uploadedFiles.map(f => f.filename);
 
             // 添加用户消息（含附件信息）
@@ -780,6 +799,7 @@
                         message: message,
                         session_id: sessionId,
                         file_ids: currentFileIds,
+                        image_ids: currentImageIds,
                         chat_history: chatHistory,
                     }),
                 });

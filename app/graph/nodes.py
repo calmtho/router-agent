@@ -5,6 +5,7 @@ import json
 from app.agents.chat_agent import chat_agent
 from app.agents.mcp_agent import mcp_agent
 from app.agents.rag_agent import rag_agent
+from app.agents.vision_agent import vision_agent
 from app.config import config
 from app.data.sensitive_words import contains_sensitive_word
 from app.services.llm_client import get_llm_client
@@ -16,7 +17,7 @@ from .state import AgentState
 
 async def preprocess_node(state: AgentState) -> AgentState:
     """
-    预处理节点 - 错别字纠正 → 敏感词过滤
+    预处理节点 - 错别字纠正 → 敏感词过滤 → 图片路径解析
     """
     message = state.get("message", "")
     original_message = message
@@ -43,10 +44,20 @@ async def preprocess_node(state: AgentState) -> AgentState:
             "error": "sensitive_content",
         }
 
+    # Step 3: 图片 ID → 文件路径 解析
+    image_ids = state.get("image_ids", [])
+    image_paths = []
+    if image_ids:
+        from app.routers.upload_image import resolve_image_paths
+        image_paths = resolve_image_paths(image_ids)
+        logger.info(f"[Preprocess] Resolved {len(image_paths)}/{len(image_ids)} image paths")
+
     result: AgentState = {}
     if message != original_message:
         result["message"] = message
         result["original_message"] = original_message
+    if image_paths:
+        result["image_paths"] = image_paths
     return result
 
 
@@ -60,6 +71,7 @@ async def router_node(state: AgentState) -> AgentState:
     from app.chains.cot_chain import cot_chain
 
     has_file = bool(state.get("file_ids"))
+    has_image = bool(state.get("image_ids"))
 
     try:
         # 调用 CoT 链进行路由决策
@@ -67,6 +79,7 @@ async def router_node(state: AgentState) -> AgentState:
         routing_result = await cot_chain.route(
             state["message"],
             has_file=has_file,
+            has_image=has_image,
             original_query=state.get("original_message"),
         )
 
@@ -204,6 +217,52 @@ async def mcp_node(state: AgentState) -> AgentState:
         error_result = {
             "answer": "抱歉，工具调用失败，请稍后重试。",
             "agent_used": state.get("target_agent", "mcp"),
+            "error": str(e),
+        }
+        if span:
+            span.update(output=error_result, status_code=500)
+        return error_result
+
+
+async def vision_node(state: AgentState) -> AgentState:
+    """
+    Vision 代理节点 - 图片理解问答
+
+    处理流程：
+      Phase 1: VL 模型提取结构化特征
+      Phase 2: 文本 LLM 自检特征充足性
+      Phase 3: 补偿轮（可选）
+      Phase 4: 文本 LLM 基于特征回答
+    """
+    from app.main import get_langfuse_client
+    langfuse = get_langfuse_client()
+
+    span = None
+    if langfuse:
+        span = langfuse.span(
+            name="vision_agent",
+            input={
+                "query": state["message"],
+                "image_count": len(state.get("image_paths", [])),
+                "session_id": state["session_id"],
+            },
+            session_id=state["session_id"],
+        )
+
+    try:
+        result = await vision_agent.handle(state["message"], state)
+
+        return {
+            "answer": result.get("answer", ""),
+            "agent_used": state.get("target_agent", "vision"),
+            "features": result.get("features", ""),
+        }
+
+    except Exception as e:
+        logger.error(f"Vision node failed: {e}")
+        error_result = {
+            "answer": "抱歉，图片分析失败，请稍后重试。",
+            "agent_used": state.get("target_agent", "vision"),
             "error": str(e),
         }
         if span:

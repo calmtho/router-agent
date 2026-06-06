@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -11,17 +12,17 @@ from app.config import config
 from app.routers.chat import router as chat_router
 from app.routers.stt import router as stt_router
 from app.routers.upload import router as upload_router
+from app.routers.upload_image import router as upload_image_router
 from app.utils.logger import logger, setup_logger
 
 
 # 全局 Langfuse 实例（通过 callback handler 自动追踪 LLM 调用）
 _langfuse_client: Langfuse | None = None
-_langfuse_callback_handler = None
 
 
 def init_langfuse() -> None:
     """初始化 Langfuse 客户端和 callback handler"""
-    global _langfuse_client, _langfuse_callback_handler
+    global _langfuse_client
 
     if not config.langfuse.enabled:
         logger.info("Langfuse is disabled, skipping initialization")
@@ -42,34 +43,6 @@ def init_langfuse() -> None:
 def get_langfuse_client() -> Langfuse | None:
     """获取全局 Langfuse 客户端实例"""
     return _langfuse_client
-
-
-def get_langfuse_callback_handler():
-    """
-    获取 Langfuse callback handler（延迟初始化）。
-
-    LangChain callback handler 需要在 LLM 模型初始化之后才能创建，
-    因此这里延迟到第一次被调用时才构建。
-    """
-    global _langfuse_callback_handler
-
-    if _langfuse_callback_handler is not None:
-        return _langfuse_callback_handler
-
-    if _langfuse_client is None:
-        return None
-
-    # 延迟导入，避免 langfuse 未安装时导入失败
-    from langfuse.callback import CallbackHandler
-
-    _langfuse_callback_handler = CallbackHandler(
-        public_key=config.langfuse.public_key,
-        secret_key=config.langfuse.secret_key,
-        host=config.langfuse.host,
-    )
-    logger.info("Langfuse callback handler registered")
-
-    return _langfuse_callback_handler
 
 
 # 自定义 uvicorn 日志配置：关键点 disable_existing_loggers=False，
@@ -111,32 +84,56 @@ async def lifespan(app: FastAPI):
     # 初始化 Langfuse（如果启用）
     init_langfuse()
 
-    # 初始化 LLM client，传入 Langfuse callback handler
+    # 初始化 LLM client（callback handler 在 langfuse 4.x + langchain 1.x 已废弃）
     from app.services.llm_client import get_llm_client
 
-    handler = get_langfuse_callback_handler()
-    get_llm_client(handler=handler)
+    get_llm_client()
 
-    # 预加载 FunASR STT 模型（可选，未安装 funasr 则跳过）
-    from app.services.stt_service import get_stt_service
-    stt = get_stt_service()
-    stt.load_model("paraformer-zh")
+    # ── 后台异步加载模型（不阻塞启动） ──
+    async def _load_models():
+        # STT
+        try:
+            from app.services.stt_service import get_stt_service
 
-    # 预加载 macbert4csc 纠错模型（可选，未安装 transformers 或模型下载失败则跳过）
-    try:
-        from app.services.typo_service import get_typo_corrector
-        corrector = get_typo_corrector()
-        corrector.load_model(config.preprocess.typo_model)
-    except Exception as e:
-        logger.warning(f"Typo correction model preload skipped: {e}")
+            stt = get_stt_service()
+            logger.info("[STT] 开始加载模型...")
+            await asyncio.to_thread(stt.load_model, "paraformer-zh")
+            logger.info("[STT] 模型加载完成")
+        except Exception as e:
+            logger.warning(f"[STT] 模型加载失败: {e}")
+
+        # 纠错
+        try:
+            from app.services.typo_service import get_typo_corrector
+
+            corrector = get_typo_corrector()
+            logger.info("[Typo] 开始加载模型...")
+            await asyncio.to_thread(corrector.load_model, config.preprocess.typo_model)
+            logger.info("[Typo] 模型加载完成")
+        except Exception as e:
+            logger.warning(f"[Typo] 模型加载失败: {e}")
+
+        # Reranker（首次 RAG 请求不用再等 11s）
+        try:
+            from app.services.reranker_service import get_reranker_service
+
+            reranker = get_reranker_service()
+            logger.info("[Reranker] 开始预加载模型...")
+            await asyncio.to_thread(reranker.load_model)
+            logger.info("[Reranker] 模型预加载完成")
+        except Exception as e:
+            logger.warning(f"[Reranker] 模型预加载失败: {e}")
+
+    background_task = asyncio.create_task(_load_models())
 
     # 兜底：如果用 uvicorn CLI 启动（不走 __main__），
     # 此处重新启用被 uvicorn dictConfig 禁用的 logger
     setup_logger("app")
     logging.getLogger("app").disabled = False
-    logger.info("Starting up...")
+    logger.info("Starting up... (models loading in background)")
     os.makedirs("uploads", exist_ok=True)
     yield
+    background_task.cancel()
     logger.info("Shutting down...")
 
     # 关闭 Langfuse 客户端（刷新缓冲区，确保数据发送）
@@ -165,6 +162,7 @@ app.add_middleware(
 app.include_router(chat_router)
 app.include_router(stt_router)
 app.include_router(upload_router)
+app.include_router(upload_image_router)
 
 
 @app.get("/health")

@@ -67,6 +67,47 @@ def append_history(session_id: str, user_msg: str, assistant_msg: str) -> None:
     ])
 
 
+def update_turn_metadata(session_id: str, turn: int | None = None,
+                         user_metadata: dict | None = None,
+                         assistant_metadata: dict | None = None) -> bool:
+    """更新指定轮次（或最后一轮）的 metadata
+
+    在不改动已有 agents 调用 append_history 的签名前提下，
+    通过此函数在 chat.py 中补写本轮用到的 image_ids / features 等元数据。
+
+    Args:
+        session_id: 会话 ID
+        turn: 轮次号，None 表示最后一轮
+        user_metadata: 用户消息的 metadata（如 image_ids）
+        assistant_metadata: 助手消息的 metadata（如 features, agent_used）
+
+    Returns:
+        True 更新成功，False 未找到对应 turn
+    """
+    history = _session_history.get(session_id, [])
+    if not history:
+        return False
+
+    if turn is None:
+        # 取最后一个 turn
+        all_turns = sorted(set(m.get("turn", 0) for m in history))
+        if not all_turns:
+            return False
+        turn = all_turns[-1]
+
+    updated = False
+    for m in history:
+        if m.get("turn") == turn:
+            if m["role"] == "user" and user_metadata:
+                m["metadata"] = {**m.get("metadata", {}), **user_metadata}
+                updated = True
+            elif m["role"] == "assistant" and assistant_metadata:
+                m["metadata"] = {**m.get("metadata", {}), **assistant_metadata}
+                updated = True
+
+    return updated
+
+
 def get_summary(session_id: str) -> str:
     """获取会话摘要"""
     return _session_summaries.get(session_id, "")
@@ -170,10 +211,28 @@ async def generate_summary(session_id: str, conversation_history: List[dict] = N
             else:
                 summary_context = ""
 
+            # 格式化历史消息，含 metadata 上下文
+            history_lines = []
+            for m in old_history[-20:]:
+                role = "用户" if m["role"] == "user" else "助手"
+                line = f"{role}：{m['content']}"
+                meta = m.get("metadata")
+                if meta:
+                    ctx_parts = []
+                    if meta.get("image_ids"):
+                        ctx_parts.append(f"[关联{len(meta['image_ids'])}张图片]")
+                    if meta.get("features"):
+                        # 提取简短的特征摘要（取前 100 字）
+                        feat = str(meta["features"])[:100]
+                        ctx_parts.append(f"[图片特征：{feat}]")
+                    if ctx_parts:
+                        line += " " + " ".join(ctx_parts)
+                history_lines.append(line)
+
             summary_prompt = f"""请根据以下内容，生成一个简短的摘要（50字以内）。
 
 {summary_context}对话历史：
-{chr(10).join(f"{'用户' if m['role'] == 'user' else '助手'}：{m['content']}" for m in old_history[-20:])}
+{chr(10).join(history_lines)}
 
 请用中文生成摘要，格式：这是关于XXX的对话"""
 

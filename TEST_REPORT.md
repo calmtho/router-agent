@@ -1,6 +1,6 @@
 # 代码审查与测试报告
 
-> 最后更新: 2026-06-05
+> 最后更新: 2026-06-06
 
 ## 代码审查发现的问题
 
@@ -57,6 +57,7 @@
 | `tests/test_stt_local.py` | - | FunASR 语音转写本地测试（首次启动下载模型） |
 | `tests/test_preprocess.py` | 3 | 预处理管道：TypoService 纠错、preprocess_node 集成、配置 |
 | `tests/test_reranker.py` | - | Cross-Encoder 重排序模型加载与精排测试（非 pytest 用例） |
+| `tests/test_vision_e2e.py` | - | Vision 端到端测试：自动启动服务→上传图片→图文问答（独立运行） |
 | `tests/test_imports.py` | - | 模块导入检查（非 pytest 用例） |
 
 ### 测试分类明细
@@ -100,6 +101,7 @@
 |------|------|------|
 | 测试 PDF | `fixtures/rag_test_document.pdf` | 预生成，约 642KB，纳入 git 版本管理 |
 | 测试音频 | `fixtures/ai_learn.wav` | STT 测试用中文语音样本，纳入 git 版本管理 |
+| 测试图片 | `fixtures/test_image.png` | Vision E2E 测试用图片，纳入 git 版本管理 |
 
 **约定**: 测试用静态文件统一存放在 `fixtures/` 目录，不使用运行时生成。已移除 `reportlab` 依赖。
 
@@ -151,6 +153,7 @@
 - ✅ 会话历史管理（标题摘要、滚动摘要、滑动窗口、历史裁剪、标题与摘要独立共存）
 - ✅ 预处理管道（错字纠正 + 敏感词过滤，`test_preprocess.py`）
 - ✅ Cross-Encoder 重排序精排（模型加载、降级机制、排序逻辑，`test_reranker.py`）
+- ✅ Vision 图片理解端到端（上传图片→图文问答，`test_vision_e2e.py`）
 - ⚠️ CoT 推理链（需 LLM 服务）
 - ⚠️ 代理系统（需 LLM / Milvus 服务）
 - ⚠️ 主代理路由逻辑（需 LLM 服务）
@@ -203,6 +206,7 @@
 6. ✅ 错别字纠正功能实现与归档（`typo_service.py`、`test_preprocess.py`、`test_imports.py`）
 7. ✅ SPEC.md 迁移至 `specs/spec.md` 作为唯一事实标准，根目录不再放设计文档
 8. ✅ 两阶段检索精排（reranker_service.py + test_reranker.py）
-9. 🔄 增加 CoT 链和代理的 mock 测试
-9. 🔄 增加 API 端点集成测试（FastAPI TestClient）
-10. 📊 优化测试覆盖目标至 80%+
+9. ✅ 图片理解功能实现与归档（vision_agent.py、vl_client.py、upload_image.py、session_context_service.py、test_vision_e2e.py）
+10. 🔄 增加 CoT 链和代理的 mock 测试
+11. 🔄 增加 API 端点集成测试（FastAPI TestClient）
+12. 📊 优化测试覆盖目标至 80%+

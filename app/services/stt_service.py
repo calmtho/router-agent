@@ -21,6 +21,22 @@ class STTService:
     def is_ready(self) -> bool:
         return self._model is not None
 
+    @staticmethod
+    def _resolve_model_path(alias: str, hub: str = "ms") -> str:
+        """
+        解析模型路径：
+        - 如果本地有缓存，返回本地绝对路径 → AutoModel 将直接加载，跳过下载
+        - 如果没有缓存，返回原别名 → AutoModel 将正常联网下载
+        """
+        from funasr.download.name_maps_from_hub import name_maps_ms
+        from modelscope.hub.snapshot_download import snapshot_download
+
+        model_id = name_maps_ms.get(alias, alias) if hub == "ms" else alias
+        try:
+            return snapshot_download(model_id, local_files_only=True)
+        except Exception:
+            return alias
+
     def load_model(self, model_type: str = "paraformer-zh"):
         """加载 FunASR Paraformer-zh 离线模型（应在应用启动时调用一次）"""
         try:
@@ -31,10 +47,15 @@ class STTService:
 
         logger.info(f"[STT] 正在加载模型: {model_type} ...")
         try:
+            # 分别解析三个模型的本地缓存路径（有缓存传路径，无缓存传别名）
+            model_path = self._resolve_model_path("paraformer-zh", "ms")
+            vad_path   = self._resolve_model_path("fsmn-vad", "ms")
+            punc_path  = self._resolve_model_path("ct-punc-c", "ms")
+
             self._model = AutoModel(
-                model="paraformer-zh",
-                vad_model="fsmn-vad",    # 语音活动检测（长音频自动切分）
-                punc_model="ct-punc",    # 标点恢复（同时消除多余空格）
+                model=model_path,
+                vad_model=vad_path,
+                punc_model=punc_path,
                 disable_update=True,
                 hub="ms",
             )

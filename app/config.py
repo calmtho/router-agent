@@ -53,6 +53,15 @@ class PaddleOCRConfig(BaseModel):
     model: str = "PaddleOCR-VL-1.6"
 
 
+class VisionConfig(BaseModel):
+    openai_base_url: str
+    api_key: str
+    model_name: str
+    temperature: float = 0.1
+    max_tokens: int = 2048
+    phases: str = "simple"  # "simple" | "full"
+
+
 class MainAgentConfig(BaseModel):
     cot_prompt_template: str
     fallback_agent: str = "chat"
@@ -87,6 +96,7 @@ class Config(BaseSettings):
     milvus: MilvusConfig
     mcp: MCPConfig
     rag: RAGConfig
+    vision: VisionConfig
     paddle_ocr: PaddleOCRConfig = Field(default_factory=PaddleOCRConfig)
     main_agent: MainAgentConfig
     server: ServerConfig

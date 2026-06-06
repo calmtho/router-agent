@@ -9,6 +9,7 @@
 | **智能路由** | 主代理通过 CoT 推理自动分发用户请求到合适的子代理 |
 | **错别字纠正** | 基于 macbert4csc 的中文错别字自动纠正，预处理管道第一步 |
 | **文档问答** | 基于 Milvus 向量库 + 两阶段检索（粗排→Cross-Encoder 精排）的 RAG 增强，支持 PDF、TXT、MD、DOCX 文件 |
+| **图片理解** | 小 VL + 大 LLM 模式，4 阶段架构（VL 特征提取→LLM 自检→补偿轮→LLM 回答），支持 jpg/png/webp/gif/bmp/tiff |
 | **工具调用** | 遵循 Model Context Protocol 调用外部工具（计算器、API 等） |
 | **自由对话** | 提供通用对话能力，支持 OpenAI 兼容的大模型 |
 | **会话上下文管理** | 双层摘要机制——标题摘要（UI 展示）+ 滚动摘要（上下文窗口管理），历史自动裁剪 |
@@ -19,16 +20,18 @@
 
 ```
 用户录音（可选）→ POST /stt/transcribe → 填入输入框
+用户图片（可选）→ POST /upload/image → 获得 image_id
                                     ↓
-用户请求（文字/转写结果）
+用户请求（文字/转写结果，可附带 image_ids）
     ↓
 [FastAPI /chat 接口]
     ↓
 [Main Agent - CoT 推理路由]
     ↓
-    ├── Chat Agent  → 直接对话
-    ├── RAG Agent   → 文档检索 + 问答
-    └── MCP Agent   → 工具调用
+    ├── Chat Agent   → 直接对话
+    ├── RAG Agent    → 文档检索 + 问答
+    ├── MCP Agent    → 工具调用
+    └── Vision Agent → 图片理解问答（VL提取→LLM自检→补偿→LLM回答）
 ```
 
 ## 🚀 快速开始
@@ -372,6 +375,41 @@ curl -X POST http://localhost:8000/stt/transcribe \
 }
 ```
 
+### 示例 5: 图片理解问答
+
+先上传图片，再用返回的 `image_id` 进行图文问答：
+
+```bash
+# 步骤 1: 上传图片
+curl -X POST http://localhost:8000/upload/image \
+  -F "file=@photo.jpg"
+```
+
+**上传响应：**
+```json
+{
+  "image_id": "a1b2c3d4e5f6",
+  "filename": "photo.jpg",
+  "size_bytes": 123456
+}
+```
+
+```bash
+# 步骤 2: 用 image_id 进行图文问答
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message":"这张图片里有什么？","image_ids":["a1b2c3d4e5f6"]}'
+```
+
+**响应示例：**
+```json
+{
+  "reply": "图片中展示了一片蓝天下的雪山风景...",
+  "agent_used": "vision",
+  "cot_reasoning": "用户询问图片内容"
+}
+```
+
 ## 🔧 配置文件说明
 
 ### 核心配置 (`configs/config.yaml`)
@@ -407,6 +445,13 @@ curl -X POST http://localhost:8000/stt/transcribe \
 │   ├── rerank_model          # Cross-Encoder 精排模型
 │   ├── rerank_batch_size     # 批处理大小
 │   └── rerank_output_k       # 重排序后输出数量
+│
+├── vision           # VL 多模态模型配置（图片理解）
+│   ├── openai_base_url       # VL 模型 API 地址
+│   ├── api_key               # VL 模型 API 密钥
+│   ├── model_name            # VL 模型名称
+│   ├── temperature           # 温度参数
+│   └── max_tokens            # 最大输出 token
 │
 ├── main_agent       # 主代理配置
 │   ├── cot_prompt_template   # CoT 推理提示模板
@@ -451,6 +496,7 @@ python tests/test_paddle.py
 - ✅ FunASR 语音转写本地测试（`tests/test_stt_local.py`）
 - ✅ 预处理管道：错字纠正 + 敏感词过滤（`tests/test_preprocess.py`）
 - ✅ Cross-Encoder 重排序精排（`tests/test_reranker.py`）
+- ✅ Vision 图片理解端到端（`tests/test_vision_e2e.py`）
 
 **测试资源：** 静态测试文件统一存放在 `fixtures/` 目录，纳入 git 版本管理，无需运行时生成。
 
@@ -467,13 +513,15 @@ router_agent/
 │   │   ├── sub_agent_base.py   # 子代理基类
 │   │   ├── chat_agent.py       # 闲聊代理
 │   │   ├── rag_agent.py        # RAG 代理
-│   │   └── mcp_agent.py        # MCP 工具代理
+│   │   ├── mcp_agent.py        # MCP 工具代理
+│   │   └── vision_agent.py     # 图片理解代理（小VL+大LLM 4阶段架构）
 │   ├── chains/                 # LangChain 链
 │   │   ├── cot_chain.py        # CoT 推理链
 │   │   └── rag_chain.py        # RAG 检索链
 │   ├── routers/                # API 路由
 │   │   ├── chat.py             # 聊天接口
 │   │   ├── upload.py           # 文件上传接口
+│   │   ├── upload_image.py     # 图片上传接口（持久化注册表）
 │   │   └── stt.py              # 语音转文字接口
 │   ├── services/               # 服务层
 │   │   ├── llm_client.py       # LLM + 本地 Embedding
@@ -482,6 +530,8 @@ router_agent/
 │   │   ├── history_service.py  # 对话历史管理（标题/摘要生成、滑动窗口、历史裁剪）
 │   │   ├── stt_service.py      # STT 语音转写服务（FunASR 封装）
 │   │   ├── typo_service.py     # 错别字纠正服务（macbert4csc 封装）
+│   │   ├── vl_client.py        # VL 多模态客户端（OpenAI 兼容）
+│   │   ├── session_context_service.py  # Session Context（图片ID继承）
 │   │   └── reranker_service.py # 检索重排序（Cross-Encoder 精排）
 │   ├── mcp_servers/            # MCP 工具服务器
 │   │   └── calculator_server.py # 计算器工具示例
@@ -494,6 +544,7 @@ router_agent/
 │   └── test_stream.html        # 流式聊天测试页面
 ├── fixtures/                   # 测试用静态资源（预生成，纳入 git）
 │   ├── ai_learn.wav            # STT 测试用音频
+│   ├── test_image.png          # Vision E2E 测试用图片
 │   └── rag_test_document.pdf   # RAG / PaddleOCR 测试用 PDF
 ├── tests/                      # 测试模块
 │   ├── conftest.py             # pytest 配置
@@ -505,6 +556,7 @@ router_agent/
 │   ├── test_stt_local.py       # FunASR 语音转写本地测试
 │   ├── test_preprocess.py       # 预处理管道测试（错字纠正 + 敏感词过滤）
 │   ├── test_reranker.py         # Cross-Encoder 重排序功能测试
+│   ├── test_vision_e2e.py       # Vision 端到端测试
 │   └── test_imports.py          # 模块导入检查
 ├── docker-compose.yml          # Docker 编排文件
 ├── Dockerfile                  # Docker 镜像构建文件
@@ -604,8 +656,9 @@ server:
 
 | 接口 | 方法 | 说明 |
 |------|------|------|
-| `/chat` | POST | 聊天接口（JSON 请求，引用已上传文件） |
+| `/chat` | POST | 聊天接口（JSON 请求，引用已上传文件/图片） |
 | `/upload` | POST | 文件上传接口（提取文本并向量化入库） |
+| `/upload/image` | POST | 图片上传接口（返回 image_id，支持 jpg/png/webp/gif/bmp/tiff） |
 | `/health` | GET | 健康检查 |
 | `/stt/transcribe` | POST | 语音转文字（支持 wav/mp3/webm 等） |
 | `/static` | GET | 静态文件服务（测试页面等） |
@@ -660,4 +713,4 @@ mcp:
 
 ---
 
-**最后更新:** 2026-06-05
+**最后更新:** 2026-06-06

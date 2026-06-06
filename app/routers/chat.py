@@ -5,7 +5,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.graph.graph import app_graph
-from app.services.history_service import generate_summary, generate_title, get_history, get_title, needs_summary
+from app.services.history_service import generate_summary, generate_title, get_history, get_title, needs_summary, update_turn_metadata
+from app.services.session_context_service import get_recent_image_ids, update_image_ids
 from app.utils.logger import log_request, log_response, logger
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -15,6 +16,7 @@ class ChatRequest(BaseModel):
     message: str
     session_id: str = ""
     file_ids: list[str] = []
+    image_ids: list[str] = []
     chat_history: list[dict] = []
 
 
@@ -22,6 +24,7 @@ class ChatRequest(BaseModel):
 from app.agents.chat_agent import chat_agent
 from app.agents.rag_agent import rag_agent
 from app.agents.mcp_agent import mcp_agent
+from app.agents.vision_agent import vision_agent
 
 
 @router.post("")
@@ -33,11 +36,19 @@ async def chat(body: ChatRequest) -> dict[str, Any]:
     # 获取历史对话（如果 session_id 存在）
     history = get_history(body.session_id) if body.session_id else []
 
+    # 继承 Session Context 中的 image_ids（非必传 scenario）
+    image_ids = body.image_ids or []
+    if not image_ids and body.session_id:
+        inherited = get_recent_image_ids(body.session_id)
+        if inherited:
+            image_ids = inherited
+
     # 构建初始状态
     initial_state = {
         "message": body.message,
         "session_id": body.session_id or "default",
-        "file_ids": body.file_ids or [],
+        "file_ids": file_ids,
+        "image_ids": image_ids,
         "chat_history": history,  # 注入历史
         "target_agent": "",
         "cot_reasoning": "",
@@ -49,6 +60,29 @@ async def chat(body: ChatRequest) -> dict[str, Any]:
     try:
         # 执行 LangGraph
         result = await app_graph.ainvoke(initial_state)
+
+        # ---- 保存 Session Context + 历史 metadata ----
+        if body.session_id:
+            # 将本轮用到的 image_ids 存入 Session Context
+            used_ids = image_ids or result.get("image_ids", [])
+            if used_ids:
+                update_image_ids(body.session_id, used_ids)
+
+            # 补写历史记录的 metadata
+            user_meta = {}
+            if used_ids:
+                user_meta["image_ids"] = used_ids
+            assistant_meta = {}
+            if result.get("features"):
+                assistant_meta["features"] = result["features"]
+            if result.get("agent_used"):
+                assistant_meta["agent_used"] = result["agent_used"]
+            if user_meta or assistant_meta:
+                update_turn_metadata(
+                    body.session_id,
+                    user_metadata=user_meta or None,
+                    assistant_metadata=assistant_meta or None,
+                )
 
         response = {
             "reply": result.get("answer", ""),
@@ -79,8 +113,11 @@ async def chat_stream(body: ChatRequest) -> StreamingResponse:
         # 检查 file_ids 是否全部就绪
         from app.routers.upload import _file_registry
 
+        file_ids = body.file_ids or []
+        image_ids = body.image_ids or []
+
         processing_files = []
-        for fid in (body.file_ids or []):
+        for fid in file_ids:
             info = _file_registry.get(fid)
             if info and info.get("status") != "ready":
                 processing_files.append(info.get("filename", fid))
@@ -93,7 +130,7 @@ async def chat_stream(body: ChatRequest) -> StreamingResponse:
 
             while True:
                 all_ready = True
-                for fid in (body.file_ids or []):
+                for fid in file_ids:
                     info = _file_registry.get(fid)
                     if not info or info.get("status") == "processing":
                         all_ready = False
@@ -116,11 +153,18 @@ async def chat_stream(body: ChatRequest) -> StreamingResponse:
         # 获取历史对话（如果 session_id 存在）
         history = get_history(body.session_id) if body.session_id else []
 
+        # 继承 Session Context 中的 image_ids（非必传 scenario）
+        if not image_ids and body.session_id:
+            inherited = get_recent_image_ids(body.session_id)
+            if inherited:
+                image_ids = inherited
+
         # 构建初始状态
         initial_state = {
             "message": body.message,
             "session_id": body.session_id or "default",
-            "file_ids": body.file_ids or [],
+            "file_ids": file_ids,
+            "image_ids": image_ids,
             "chat_history": history,  # 注入历史
             "target_agent": "",
             "cot_reasoning": "",
@@ -143,7 +187,7 @@ async def chat_stream(body: ChatRequest) -> StreamingResponse:
                 await asyncio.sleep(0.01)  # 确保数据发送
                 return
 
-            # 合并预处理结果（错别字纠正）
+            # 合并预处理结果（错别字纠正 + 图片路径解析）
             initial_state.update(preprocessed)
 
             # 2. 执行 CoT 路由节点（流式推理）
@@ -158,41 +202,65 @@ async def chat_stream(body: ChatRequest) -> StreamingResponse:
                     input={
                         "query": body.message,
                         "original_message": initial_state.get("original_message"),
-                        "has_file": bool(body.file_ids),
+                        "has_file": bool(file_ids),
+                        "has_image": bool(image_ids),
                     },
                     session_id=initial_state["session_id"],
                 )
 
-            # 流式获取 CoT 推理（直接输出 JSON）
-            cot_full = ""
-            async for chunk in cot_chain.route_stream(body.message, has_file=bool(body.file_ids)):
-                cot_full += chunk
-                # 实时流式输出推理过程（JSON）
-                yield f"data: {json.dumps({'type': 'reasoning', 'content': chunk}, ensure_ascii=False)}\n\n"
-                await asyncio.sleep(0.01)  # 确保数据发送
-
-            # 解析路由目标
+            # ── 路由决策：明确场景跳过 CoT LLM 调用 ──
+            has_file = bool(file_ids)
+            has_image = bool(image_ids)  # image_ids 已经继承了 session 上下文中的图片
             routing_result = {"target": "chat", "reasoning": ""}
-            try:
-                result = json.loads(cot_full)
-                if "target" in result:
-                    routing_result = result
-            except json.JSONDecodeError:
-                import re
-                json_match = re.search(r"\{[^}]+\}", cot_full)
-                if json_match:
-                    try:
-                        result = json.loads(json_match.group())
-                        if "target" in result:
-                            routing_result = result
-                    except json.JSONDecodeError:
-                        pass
-            target_agent = routing_result.get("target", "chat")
 
-            # 打印 CoT 推理过程到控制台
-            logger.info(f"CoT Routing - Query: {body.message}")
-            logger.info(f"CoT Response: {cot_full.strip()}")
-            logger.info(f"CoT Target Agent: {target_agent}")
+            if has_image and not has_file:
+                # 仅图片，直接路由到 vision
+                target_agent = "vision"
+                routing_result = {"target": "vision", "reasoning": "用户上传了图片，直接路由"}
+                reasoning_msg = json.dumps({'type': 'reasoning', 'content': '检测到图片，正在分析…\n'}, ensure_ascii=False)
+                yield f"data: {reasoning_msg}\n\n"
+                await asyncio.sleep(0.01)
+                logger.info(f"Fast Route (vision) - Query: {body.message[:50]}")
+
+            elif has_file:
+                # 有文件（无论是否同时有图片），优先路由到 rag 检索文档
+                target_agent = "rag"
+                routing_result = {"target": "rag", "reasoning": "用户上传了文件，直接路由"}
+                reasoning_msg = json.dumps({'type': 'reasoning', 'content': '检测到文件，正在检索…\n'}, ensure_ascii=False)
+                yield f"data: {reasoning_msg}\n\n"
+                await asyncio.sleep(0.01)
+                logger.info(f"Fast Route (rag) - Query: {body.message[:50]}")
+
+            else:
+                # 场景不明（无附件 / 混合附件 / 纯文本），走 CoT LLM 路由
+                cot_full = ""
+                async for chunk in cot_chain.route_stream(body.message, has_file=has_file, has_image=has_image):
+                    cot_full += chunk
+                    # 实时流式输出推理过程（JSON）
+                    yield f"data: {json.dumps({'type': 'reasoning', 'content': chunk}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(0.01)  # 确保数据发送
+
+                # 解析路由目标
+                try:
+                    result = json.loads(cot_full)
+                    if "target" in result:
+                        routing_result = result
+                except json.JSONDecodeError:
+                    import re
+                    json_match = re.search(r"\{[^}]+\}", cot_full)
+                    if json_match:
+                        try:
+                            result = json.loads(json_match.group())
+                            if "target" in result:
+                                routing_result = result
+                        except json.JSONDecodeError:
+                            pass
+                target_agent = routing_result.get("target", "chat")
+
+                # 打印 CoT 推理过程到控制台
+                logger.info(f"CoT Routing - Query: {body.message}")
+                logger.info(f"CoT Response: {cot_full.strip()}")
+                logger.info(f"CoT Target Agent: {target_agent}")
 
             if span:
                 span.update(output=routing_result)
@@ -218,6 +286,11 @@ async def chat_stream(body: ChatRequest) -> StreamingResponse:
                     answer_full += chunk
                     yield f"data: {json.dumps({'type': 'answer', 'content': chunk}, ensure_ascii=False)}\n\n"
                     await asyncio.sleep(0.01)  # 确保数据发送
+            elif target_agent == "vision":
+                async for chunk in vision_agent.handle_stream(query, initial_state):
+                    answer_full += chunk
+                    yield f"data: {json.dumps({'type': 'answer', 'content': chunk}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(0.01)  # 确保数据发送
             else:
                 yield f"data: {json.dumps({'type': 'error', 'message': f'未知的代理类型: {target_agent}'}, ensure_ascii=False)}\n\n"
                 await asyncio.sleep(0.01)
@@ -232,7 +305,23 @@ async def chat_stream(body: ChatRequest) -> StreamingResponse:
             yield f"data: {json.dumps(final_response, ensure_ascii=False)}\n\n"
             await asyncio.sleep(0.01)
 
-            # 5. 异步生成摘要并裁剪历史（仅在超过阈值时）
+            # 5. 保存 Session Context + 历史 metadata
+            if body.session_id:
+                if image_ids:
+                    update_image_ids(body.session_id, image_ids)
+
+                user_meta = {}
+                if image_ids:
+                    user_meta["image_ids"] = image_ids
+                assistant_meta = {"agent_used": agent_used}
+                if user_meta or assistant_meta:
+                    update_turn_metadata(
+                        body.session_id,
+                        user_metadata=user_meta or None,
+                        assistant_metadata=assistant_meta or None,
+                    )
+
+            # 6. 异步生成摘要并裁剪历史（仅在超过阈值时）
             if body.session_id and needs_summary(body.session_id, threshold=10):
                 # 异步生成摘要，不阻塞响应
                 async def generate_summary_task():
@@ -245,7 +334,7 @@ async def chat_stream(body: ChatRequest) -> StreamingResponse:
                 # 启动后台任务
                 asyncio.create_task(generate_summary_task())
 
-            # 6. 异步生成标题（首次对话时）
+            # 7. 异步生成标题（首次对话时）
             if body.session_id and not get_title(body.session_id):
                 async def generate_title_task():
                     try:

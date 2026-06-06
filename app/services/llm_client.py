@@ -1,12 +1,13 @@
 from typing import Any, AsyncGenerator
 
-from langchain_community.embeddings import HuggingFaceEmbeddings
+import numpy as np
+from sentence_transformers import SentenceTransformer
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langchain_core.outputs import ChatGenerationChunk
 
 from app.config import config
-from app.utils.logger import log_error
+from app.utils.logger import log_error, logger
 
 
 class LLMClient:
@@ -22,11 +23,19 @@ class LLMClient:
             max_tokens=config.llm.max_tokens,
             callbacks=[callback_handler] if callback_handler else [],
         )
-        self.embed_model = HuggingFaceEmbeddings(
-            model_name=config.milvus.embedding_model,
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True},
-        )
+        # 先尝试从本地缓存加载 Embedding 模型，避免每次联网检查
+        try:
+            self.embed_model = SentenceTransformer(
+                config.milvus.embedding_model,
+                device="cpu",
+                local_files_only=True,
+            )
+        except OSError:
+            logger.info("[LLM] Embedding 模型本地缓存未命中，联网加载 ...")
+            self.embed_model = SentenceTransformer(
+                config.milvus.embedding_model,
+                device="cpu",
+            )
 
     def _to_lc_messages(self, messages: list[dict[str, str]]) -> list:
         role_map = {
@@ -96,12 +105,23 @@ class LLMClient:
             log_error(e, "LLM chat stream request failed")
             raise
 
-    async def embed(self, text: str) -> list[float]:
-        try:
-            return await self.embed_model.aembed_query(text)
-        except Exception as e:
-            log_error(e, "Embedding request failed")
-            raise
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """同步方法，批量获取文档向量，始终返回纯 Python list[list[float]]"""
+        embeddings: np.ndarray = self.embed_model.encode(
+            texts,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return embeddings.tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        """同步方法，获取查询向量，始终返回纯 Python list[float]"""
+        embedding: np.ndarray = self.embed_model.encode(
+            [text],
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return embedding[0].tolist()
 
 
 llm_client: LLMClient | None = None

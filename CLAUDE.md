@@ -1,7 +1,7 @@
 # 项目概述
 本项目实现一个基于 Chain‑of‑Thought (CoT) 的 Main‑Sub Agent 架构智能代理系统，具备以下核心能力：
 
-1. **智能路由**：主代理通过 CoT 推理决定将用户请求分发至合适的子代理（闲聊 / RAG / MCP 工具调用）。
+1. **智能路由**：主代理通过 CoT 推理决定将用户请求分发至合适的子代理（闲聊 / RAG / MCP / Vision）。携带 file_ids 时短路跳过 CoT 推理，直接路由到 RAG Agent（省约 10s+）。
 2. **错别字纠正**：预处理管道第一步，基于 macbert4csc 自动纠正中文错别字，纠正后保留原文到 `original_message`。
 3. **内容安全过滤**：预处理管道第二步，检测并拦截包含敏感词的用户请求，防止不当内容进入系统。
 4. **MCP 工具调用**：子代理遵循 Model Context Protocol 调用外部工具。MCP Server 通过 stdio 子进程启动，支持计算器、网页抓取等工具。自定义 Server 可放在 `app/mcp_servers/` 目录下，在 `config.yaml` 中注册即可。
@@ -12,6 +12,7 @@
 9. **配置文件驱动**：所有模型、连接、超参数等均通过配置文件管理。
 10. **语音转写（STT）**：基于 FunASR Paraformer-zh 本地模型的中文语音转文字，前端一键录音上传，结果自动填入输入框。
 11. **OpenAI 兼容模型**：支持任何提供 OpenAI API 协议的大模型（如 GPT‑4、DeepSeek、本地 vLLM 等）。
+12. **图片理解问答**：小 VL + 大 LLM 模式，4 阶段架构（VL 结构化特征提取 → LLM 自检 → 补偿轮 → LLM 回答），支持 jpg/png/webp/gif/bmp/tiff。
 
 # 技术栈
 
@@ -30,6 +31,7 @@
 | 异步支持 | asyncio + httpx |
 | 错别字纠正 | macbert4csc-base-chinese (transformers + torch) |
 | 语音识别 | FunASR (Paraformer-zh) + soundfile + ModelScope |
+| VL 多模态 | LangChain ChatOpenAI (OpenAI 兼容 VL 模型，如 Qwen2.5-VL、InternVL2) |
 | 重排序模型 | sentence-transformers Cross-Encoder (cross-encoder/ms-marco-MiniLM-L12-v2) |
 | 测试框架 | pytest + pytest-asyncio |
 
@@ -45,7 +47,8 @@
 │   │   ├── sub_agent_base.py   # 子代理抽象基类
 │   │   ├── chat_agent.py       # 闲聊子代理
 │   │   ├── rag_agent.py        # RAG 子代理（含 Milvus 检索）
-│   │   └── mcp_agent.py        # MCP 工具调用子代理
+│   │   ├── mcp_agent.py        # MCP 工具调用子代理
+│   │   └── vision_agent.py     # 图片理解子代理（小VL+大LLM 4阶段架构）
 │   ├── chains/
 │   │   ├── cot_chain.py        # CoT 推理链（Prompt + 解析）
 │   │   └── rag_chain.py        # LangChain RAG 链
@@ -59,6 +62,7 @@
 │   ├── routers/
 │   │   ├── chat.py             # /chat 接口（JSON 请求，引用已上传文件）
 │   │   ├── upload.py           # /upload 接口（文件上传 + 向量化入库）
+│   │   ├── upload_image.py     # /upload/image 接口（图片上传 + 持久化注册表）
 │   │   └── stt.py              # /stt/transcribe 语音转文字接口
 │   ├── services/
 │   │   ├── milvus_service.py   # 向量库管理（插入/检索）
@@ -67,6 +71,8 @@
 │   │   ├── llm_client.py       # LLM 客户端 + 本地 Embedding
 │   │   ├── stt_service.py      # STT 语音转写服务（FunASR Paraformer-zh 封装）
 │   │   ├── reranker_service.py # 检索结果重排序（Cross-Encoder 精排）
+│   │   ├── vl_client.py        # VL 多模态客户端（OpenAI 兼容，Base64 data URI 传图）
+│   │   ├── session_context_service.py # Session Context（TTL 图片ID继承，跨轮保持）
 │   │   └── typo_service.py     # 错别字纠正服务（macbert4csc 封装）
 │   ├── mcp_servers/            # MCP 工具服务器
 │   │   └── calculator_server.py # 计算器工具示例
@@ -79,6 +85,7 @@
 │   └── test_stream.html        # 流式聊天测试页面
 ├── fixtures/                   # 测试用静态资源（预生成，纳入 git）
 │   ├── ai_learn.wav            # STT 测试用音频（中文语音样本）
+│   ├── test_image.png          # Vision E2E 测试用图片
 │   └── rag_test_document.pdf   # RAG / PaddleOCR 测试用 PDF
 ├── tests/                      # 测试模块
 │   ├── conftest.py             # pytest 配置
@@ -90,6 +97,7 @@
 │   ├── test_stt_local.py       # FunASR 语音转写本地测试
 │   ├── test_preprocess.py       # 预处理管道测试（错字纠正 + 敏感词过滤）
 │   ├── test_reranker.py         # 重排序功能测试
+│   ├── test_vision_e2e.py       # Vision 端到端测试（自动启动服务→上传图片→图文问答）
 │   └── test_imports.py          # 模块导入检查
 ├── requirements.txt
 ├── Dockerfile
@@ -182,4 +190,22 @@ curl -X POST http://localhost:8000/stt/transcribe \
    - **异步隔离**：使用 `asyncio.to_thread()` 将同步推理丢到独立线程，不阻塞事件循环。
    - **配置开关**：`rag.rerank_enabled` 控制是否启用，关闭时跳过重排序，直接使用原始检索结果。
    - **降级策略**：模型加载失败时自动降级为原始检索结果，不中断流程。
+   - **lifespan 预加载**：模型在 `app.main:lifespan` 启动时预加载，避免首次 RAG 请求等待约 11s。
    - **配置**：`rag.rerank_model` 指定模型名，默认 `cross-encoder/ms-marco-MiniLM-L12-v2`；`rag.rerank_batch_size` 控制批处理大小；`rag.rerank_output_k` 控制精排后输出数量。
+12. **Vision Agent 图片理解**：`app/agents/vision_agent.py` 实现小 VL + 大 LLM 模式的 4 阶段架构：
+   - **Phase 1 — VL 特征提取**：VL 模型根据用户问题从图片提取结构化特征（JSON）。
+   - **Phase 2 — LLM 自检**：文本 LLM 检查特征是否足以回答问题。
+   - **Phase 3 — 补偿轮（可选）**：线索不足时 VL 定向补充提取。
+   - **Phase 4 — LLM 回答**：文本 LLM 基于特征生成自然语言回答。
+   - **配置**：`vision` 配置段指定 VL 模型的 `openai_base_url`/`api_key`/`model_name`/`temperature`/`max_tokens`，支持任何 OpenAI 兼容 VL 模型。
+   - **VL 客户端**：`app/services/vl_client.py` 基于 `langchain-openai` ChatOpenAI，通过 Base64 data URI 传递图片。
+13. **Session Context 图片 ID 继承**：`app/services/session_context_service.py` 为每个会话维护图片 ID 列表：
+   - **TTL 过期**：默认 30 分钟，超时自动清理。
+   - **自动继承**：Chat 请求未传 `image_ids` 时，自动继承同 session 上一轮的图片 ID。
+   - **去重合并**：多轮图片 ID 按顺序去重合并。
+   - **显式清除**：用户要求"不管那张图"时可清除。
+14. **图片上传路由**：`app/routers/upload_image.py` 提供 `POST /upload/image` 接口：
+   - **支持格式**：jpg、jpeg、png、webp、gif、bmp、tiff。
+   - **持久化注册表**：图片元信息保存到 `uploads/images/.registry.json`，防止 uvicorn reload 丢失。
+   - **启动时加载**：服务启动时从磁盘加载注册表，自动清理已不存在的文件记录。
+   - **路径解析**：`resolve_image_paths(image_ids)` 供 `preprocess_node` 调用，将 image_ids 解析为文件路径。

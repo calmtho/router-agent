@@ -2,7 +2,7 @@
 
 from langgraph.graph import END, StateGraph
 
-from .nodes import chat_node, mcp_node, preprocess_node, rag_node, router_node
+from .nodes import chat_node, mcp_node, preprocess_node, rag_node, router_node, vision_node
 from .state import AgentState
 
 
@@ -14,7 +14,7 @@ def router_decision(state: AgentState) -> str:
         state: 当前图状态
 
     Returns:
-        下一个节点名称（chat, rag, mcp）
+        下一个节点名称（chat, rag, mcp, vision）
     """
     return state.get("target_agent", "chat")
 
@@ -40,7 +40,7 @@ def build_graph() -> StateGraph:
     构建主子代理图
 
     图结构：
-        __start__ -> preprocess -> router -> chat/rag/mcp -> END
+        __start__ -> preprocess -> router -> chat/rag/mcp/vision -> END
                                 -> blocked (拒绝) -> END
 
     Returns:
@@ -54,6 +54,7 @@ def build_graph() -> StateGraph:
     workflow.add_node("chat", chat_node)
     workflow.add_node("rag", rag_node)
     workflow.add_node("mcp", mcp_node)
+    workflow.add_node("vision", vision_node)
     workflow.add_node("blocked", lambda _state: {"answer": "抱歉，您的请求包含不合适的内容，我无法处理。"})
 
     # 设置入口节点
@@ -77,11 +78,12 @@ def build_graph() -> StateGraph:
             "chat": "chat",
             "rag": "rag",
             "mcp": "mcp",
+            "vision": "vision",
         },
     )
 
     # 所有代理节点都结束
-    for agent in ["chat", "rag", "mcp"]:
+    for agent in ["chat", "rag", "mcp", "vision"]:
         workflow.add_edge(agent, END)
 
     workflow.add_edge("blocked", END)

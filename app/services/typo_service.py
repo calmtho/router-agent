@@ -34,9 +34,17 @@ class TypoCorrector:
 
         name = model_name or self.MODEL_NAME
         logger.info(f"[Typo] 正在加载纠错模型: {name} ...")
+
+        # 先尝试从本地缓存加载，避免每次联网检查
         try:
+            self._tokenizer = BertTokenizer.from_pretrained(name, local_files_only=True)
+            self._model = BertForMaskedLM.from_pretrained(name, local_files_only=True)
+        except OSError:
+            logger.info(f"[Typo] 本地缓存未命中，从 HuggingFace 下载 {name} ...")
             self._tokenizer = BertTokenizer.from_pretrained(name)
             self._model = BertForMaskedLM.from_pretrained(name)
+
+        try:
             self._model.eval()
             if torch.cuda.is_available():
                 self._model = self._model.cuda()
