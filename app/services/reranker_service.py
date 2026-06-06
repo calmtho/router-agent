@@ -165,6 +165,123 @@ class RerankerService:
             return documents, False
 
 
+    async def classify_route(
+        self, query: str
+    ) -> tuple[str, float]:
+        """
+        两阶段路由分类:
+          Stage 1: Embedding 模型 → cosine 相似度初筛，取 Top-K
+          Stage 2: Reranker 模型 → 精准打分 Top-K，margin 分析
+
+        Args:
+            query: 用户输入
+
+        Returns:
+            (target_agent, confidence)  e.g. ("mcp", 0.85) 或 ("fallback", 0.35)
+
+        Raises:
+            RuntimeError: 模型未就绪
+        """
+        import numpy as np
+        from app.services.llm_client import get_llm_client
+
+        if not self.is_ready:
+            loaded = self.load_model()
+            if not self.is_ready:
+                raise RuntimeError("[Reranker] 模型未就绪，无法执行路由分类")
+
+        categories = list(config.router.category_descriptions.keys())
+        descriptions = list(config.router.category_descriptions.values())
+
+        if not categories:
+            raise RuntimeError("[Reranker] 未配置 category_descriptions，无法路由")
+
+        try:
+            # ═══════════════════════════════════════════
+            # Stage 1: Embedding 模型初筛
+            # ═══════════════════════════════════════════
+            llm = get_llm_client()
+
+            query_emb = await asyncio.to_thread(llm.embed_query, query)
+            desc_embs = await asyncio.to_thread(llm.embed_documents, descriptions)
+
+            query_vec = np.array(query_emb)
+            desc_vecs = np.array(desc_embs)
+
+            # 已 normalize_embeddings=True，dot product 即 cosine similarity
+            similarities = np.dot(desc_vecs, query_vec)
+            sorted_indices = np.argsort(similarities)[::-1]
+
+            # 打印 Embedding 阶段所有分数
+            for idx in sorted_indices:
+                logger.info(
+                    f"[Router] embedding: {categories[idx]:<8} = {similarities[idx]:.4f}"
+                )
+
+            # 取 Top-K 候选
+            top_k = config.router.embedding_top_k
+            candidate_indices = sorted_indices[:top_k]
+            candidates = [categories[i] for i in candidate_indices]
+
+            gap_first_two = (
+                similarities[candidate_indices[0]] - similarities[candidate_indices[1]]
+                if len(candidate_indices) > 1
+                else 0.0
+            )
+            logger.info(
+                f"[Router] Embedding Top-{top_k}: {candidates}, "
+                f"gap(top1-top2)={gap_first_two:.4f}"
+            )
+
+            # ═══════════════════════════════════════════
+            # Stage 2: Reranker 对 Top-K 精排
+            # ═══════════════════════════════════════════
+            pairs = [[query, descriptions[i]] for i in candidate_indices]
+            scores = await asyncio.to_thread(self._model.predict, pairs)
+            scores = np.array(scores, dtype=np.float64)
+
+            # 在候选内排序
+            local_sorted = np.argsort(scores)[::-1]
+            best_local_idx = candidate_indices[local_sorted[0]]
+            second_local_idx = (
+                candidate_indices[local_sorted[1]]
+                if len(candidate_indices) > 1
+                else best_local_idx
+            )
+
+            best_score = float(scores[local_sorted[0]])
+            second_score = (
+                float(scores[local_sorted[1]])
+                if len(candidate_indices) > 1
+                else best_score
+            )
+            margin = best_score - second_score
+
+            # Margin → Confidence (sigmoid 映射，margin 越大越接近 1.0)
+            temperature = config.router.margin_temperature
+            confidence = 1.0 / (1.0 + np.exp(-margin * temperature))
+
+            logger.info(
+                f"[Router] reranker: best={categories[best_local_idx]}({best_score:.4f}), "
+                f"2nd={categories[second_local_idx]}({second_score:.4f}), "
+                f"margin={margin:.4f} → confidence={confidence:.4f}"
+            )
+
+            threshold = config.router.confidence_threshold
+            if confidence >= threshold:
+                return categories[best_local_idx], confidence
+            else:
+                logger.info(
+                    f"[Router] 置信度不足 ({confidence:.3f} < {threshold})，"
+                    f"回退 CoT"
+                )
+                return "fallback", confidence
+
+        except Exception:
+            logger.warning("[Router] 路由分类失败，回退 CoT")
+            raise
+
+
 # 全局单例
 _reranker_service = RerankerService()
 

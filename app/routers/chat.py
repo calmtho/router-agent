@@ -1,3 +1,5 @@
+import json
+import re
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -8,6 +10,79 @@ from app.graph.graph import app_graph
 from app.services.history_service import generate_summary, generate_title, get_history, get_title, needs_summary, update_turn_metadata
 from app.services.session_context_service import get_recent_image_ids, update_image_ids
 from app.utils.logger import log_request, log_response, logger
+
+
+def _sse_reasoning(content: str) -> str:
+    """构建 SSE reasoning 消息"""
+    return f"data: {json.dumps({'type': 'reasoning', 'content': content}, ensure_ascii=False)}\n\n"
+
+
+def _is_pure_greeting_or_intro(query: str) -> bool:
+    """
+    纯问候/纯自我介绍 → True，跳过 pipeline 直接路由 chat
+    含实质请求 → False，交给两阶段 Reranker
+    """
+    q = query.strip()
+
+    # 含实质动作词 → 否决
+    action_words = [
+        "帮", "算", "查", "搜", "找", "写", "画", "翻译",
+        "告诉", "解释", "说明", "怎么", "如何", "什么", "为什么",
+        "图片", "照片", "文件", "文档", "上传"
+    ]
+    for w in action_words:
+        if w in q:
+            return False
+
+    # 纯问候/自我介绍模式
+    patterns = [
+        r'^(你好|您好|嗨|哈喽|hello|hi|hey|早上好|下午好|晚上好|晚安|再见|拜拜|bye|在吗|在不在)[呀啊哦噢哟]*[\s!！。.,，~～]*$',
+        r'^(你好|您好|嗨|哈喽|hello|hi|hey)[呀啊哦噢哟]*[\s,，]+我(是|叫|叫作).+$',
+        r'^我(是|叫|叫作).+$',
+        r'^(好久不见|最近怎么样|吃了吗|干啥呢|在干嘛)[\s!！。.,，~～]*$',
+        r'^(谢谢|多谢|感谢|辛苦了|ok|好的|嗯嗯|哦哦|哈哈)[你您]?[\s!！。.,，~～]*$',
+    ]
+    for p in patterns:
+        if re.match(p, q, re.IGNORECASE):
+            return True
+
+    return False
+
+
+def _strip_greeting_prefix(query: str) -> str:
+    """去掉开头的问候前缀，避免 '你好，帮我xxx' 中的问候词干扰 Reranker"""
+    q = query.strip()
+    m = re.match(r'^(你好|您好|嗨|哈喽|hello|hi|hey)[呀啊哦噢哟]?[，,。.]+\s*', q)
+    if m:
+        stripped = q[m.end():].strip()
+        if stripped:
+            return stripped
+    return q
+
+
+async def _classify_via_reranker(query: str) -> tuple[str | None, dict | None]:
+    """Reranker 两阶段路由，返回 (target, result_dict) 或 (None, None)"""
+    try:
+        from app.services.reranker_service import get_reranker_service
+        from app.config import config as app_config
+
+        reranker = get_reranker_service()
+        if not reranker.is_ready:
+            return None, None
+
+        fast_target, fast_conf = await reranker.classify_route(query)
+        logger.info(f"[Stream Route] Reranker: target={fast_target}, confidence={fast_conf:.3f}")
+
+        if fast_conf >= app_config.router.confidence_threshold:
+            return fast_target, {
+                "target": fast_target,
+                "reasoning": f"Reranker 快速路由 (置信度={fast_conf:.2f})"
+            }
+    except Exception as e:
+        logger.warning(f"[Stream Route] Reranker 失败，回退 CoT: {e}")
+
+    return None, None
+
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -232,35 +307,56 @@ async def chat_stream(body: ChatRequest) -> StreamingResponse:
                 logger.info(f"Fast Route (rag) - Query: {body.message[:50]}")
 
             else:
-                # 场景不明（无附件 / 混合附件 / 纯文本），走 CoT LLM 路由
-                cot_full = ""
-                async for chunk in cot_chain.route_stream(body.message, has_file=has_file, has_image=has_image):
-                    cot_full += chunk
-                    # 实时流式输出推理过程（JSON）
-                    yield f"data: {json.dumps({'type': 'reasoning', 'content': chunk}, ensure_ascii=False)}\n\n"
-                    await asyncio.sleep(0.01)  # 确保数据发送
+                # 场景不明（无附件）
+                target_agent = None
+                routing_result = {"target": "chat", "reasoning": ""}
 
-                # 解析路由目标
-                try:
-                    result = json.loads(cot_full)
-                    if "target" in result:
-                        routing_result = result
-                except json.JSONDecodeError:
-                    import re
-                    json_match = re.search(r"\{[^}]+\}", cot_full)
-                    if json_match:
-                        try:
-                            result = json.loads(json_match.group())
-                            if "target" in result:
-                                routing_result = result
-                        except json.JSONDecodeError:
-                            pass
-                target_agent = routing_result.get("target", "chat")
+                if _is_pure_greeting_or_intro(body.message):
+                    # 纯问候/自我介绍 → 快速通道
+                    target_agent = "chat"
+                    routing_result = {"target": "chat", "reasoning": "问候语快速路由"}
+                    yield _sse_reasoning('分析完成 → chat 代理处理中…\n')
+                    await asyncio.sleep(0.01)
+                    logger.info(f"Fast Route (chat) - Query: {body.message[:50]}")
+                else:
+                    clean_query = _strip_greeting_prefix(body.message)
+                    target_agent, route_result = await _classify_via_reranker(clean_query)
+                    if route_result is not None:
+                        routing_result = route_result
+                    if target_agent is not None:
+                        yield _sse_reasoning(f'分析完成 → {target_agent} 代理处理中…\n')
+                        await asyncio.sleep(0.01)
+                        logger.info(f"Fast Route ({target_agent}) - Query: {body.message[:50]}")
 
-                # 打印 CoT 推理过程到控制台
-                logger.info(f"CoT Routing - Query: {body.message}")
-                logger.info(f"CoT Response: {cot_full.strip()}")
-                logger.info(f"CoT Target Agent: {target_agent}")
+                if target_agent is None:
+                    # Reranker 没命中，走原来的 CoT LLM 路由
+                    cot_full = ""
+                    async for chunk in cot_chain.route_stream(body.message, has_file=has_file, has_image=has_image):
+                        cot_full += chunk
+                        # 实时流式输出推理过程（JSON）
+                        yield f"data: {json.dumps({'type': 'reasoning', 'content': chunk}, ensure_ascii=False)}\n\n"
+                        await asyncio.sleep(0.01)
+
+                    # 解析路由目标
+                    try:
+                        result = json.loads(cot_full)
+                        if "target" in result:
+                            routing_result = result
+                    except json.JSONDecodeError:
+                        json_match = re.search(r"\{[^}]+\}", cot_full)
+                        if json_match:
+                            try:
+                                result = json.loads(json_match.group())
+                                if "target" in result:
+                                    routing_result = result
+                            except json.JSONDecodeError:
+                                pass
+                    target_agent = routing_result.get("target", "chat")
+
+                    # 打印 CoT 推理过程到控制台
+                    logger.info(f"CoT Routing - Query: {body.message}")
+                    logger.info(f"CoT Response: {cot_full.strip()}")
+                    logger.info(f"CoT Target Agent: {target_agent}")
 
             if span:
                 span.update(output=routing_result)

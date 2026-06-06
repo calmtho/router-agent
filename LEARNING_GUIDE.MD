@@ -24,13 +24,17 @@
 | app/graph/state.py | 状态定义 | LangGraph 的 AgentState 结构 |
 | app/graph/graph.py | 图构建 | 节点和边的连接关系 |
 | app/graph/nodes.py | 图节点 | preprocess（错字纠正→敏感词过滤）/router/chat/rag/mcp 节点实现 |
-| app/chains/cot_chain.py | CoT 推理链 | LLM 如何决定路由目标 |
+| app/chains/cot_chain.py | CoT 推理链 | LLM CoT 路由兜底（Reranker 置信度不足时启用）+ 路由专用小模型 |
 
 **关键流程：**
 
 ```
 用户请求 → preprocess_node(错字纠正→敏感词过滤→图片路径解析)
-        → router_node(CoT 推理决定 target_agent)
+        → 纯问候/自我介绍 → chat 快速通道
+        → 带附件(file_ids/image_ids) → 短路直接路由
+        → 场景不明 → Reranker 两阶段路由(Embedding初筛→Reranker精排)
+                   → 置信度足够 → 直接分发
+                   → 置信度不足 → CoT LLM 兜底路由
         → 条件边路由到 chat/rag/mcp/vision
         → 返回结果
 ```
@@ -61,7 +65,7 @@
 | app/services/milvus_service.py | 向量服务 | Milvus 检索 + LangChain vectorstore |
 | app/services/mcp_client.py | MCP 客户端 | stdio 子进程通信、mcp SDK |
 | app/services/typo_service.py | 错别字纠正 | macbert4csc 单例、asyncio.to_thread 异步推理 |
-| app/services/reranker_service.py | 重排序服务 | Cross-Encoder 模型加载、rerank() 接口、降级策略 |
+| app/services/reranker_service.py | 重排序+路由服务 | RAG 精排 + 两阶段路由分类(classify_route)、降级策略 |
 | app/services/vl_client.py | VL 多模态客户端 | ChatOpenAI + Base64 data URI 传图、单例延迟初始化 |
 | app/services/session_context_service.py | Session Context | 图片 ID 继承、TTL 过期清理、去重合并 |
 | app/services/history_service.py | 对话历史管理 | 标题摘要 / 滚动摘要双层机制、滑动窗口、历史裁剪 |

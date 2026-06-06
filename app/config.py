@@ -16,6 +16,23 @@ class LLMConfig(BaseModel):
     max_tokens: int = 1024
 
 
+class RouterLLMConfig(BaseModel):
+    """路由专用 LLM 配置（小模型，仅用于 reranker 置信度不足时的 CoT 兜底路由）"""
+    openai_base_url: str
+    api_key: str
+    model_name: str
+    temperature: float = 0.1
+    max_tokens: int = 256
+
+
+class RouterConfig(BaseModel):
+    """路由配置（Embedding 初筛 → Reranker 精排 → Margin 置信度）"""
+    confidence_threshold: float = 0.6
+    margin_temperature: float = 2.0
+    embedding_top_k: int = 2
+    category_descriptions: dict[str, str] = {}
+
+
 class MilvusConfig(BaseModel):
     host: str
     port: int
@@ -93,6 +110,8 @@ class Config(BaseSettings):
     )
 
     llm: LLMConfig
+    router_llm: RouterLLMConfig
+    router: RouterConfig = Field(default_factory=RouterConfig)
     milvus: MilvusConfig
     mcp: MCPConfig
     rag: RAGConfig

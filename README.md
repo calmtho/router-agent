@@ -1,12 +1,12 @@
 # Router Agent - 智能代理系统
 
-基于 Chain-of-Thought (CoT) 的 Main-Sub Agent 架构智能代理，支持智能路由、文档问答、工具调用和对话交互。
+基于两阶段 Reranker 路由 + CoT 兜底的 Main-Sub Agent 架构智能代理，支持智能路由、文档问答、工具调用和对话交互。
 
 ## 🌟 功能特性
 
 | 功能 | 描述 |
 |------|------|
-| **智能路由** | 主代理通过 CoT 推理自动分发用户请求到合适的子代理 |
+| **智能路由** | 主代理通过两阶段 Reranker（Embedding 初筛→Reranker 精排）优先决策分发，置信度不足时 CoT 兜底 |
 | **错别字纠正** | 基于 macbert4csc 的中文错别字自动纠正，预处理管道第一步 |
 | **文档问答** | 基于 Milvus 向量库 + 两阶段检索（粗排→Cross-Encoder 精排）的 RAG 增强，支持 PDF、TXT、MD、DOCX 文件 |
 | **图片理解** | 小 VL + 大 LLM 模式，4 阶段架构（VL 特征提取→LLM 自检→补偿轮→LLM 回答），支持 jpg/png/webp/gif/bmp/tiff |
@@ -26,7 +26,7 @@
     ↓
 [FastAPI /chat 接口]
     ↓
-[Main Agent - CoT 推理路由]
+[路由决策：纯问候 → chat / 带附件 → 短路 / 其他 → 两阶段 Reranker → CoT 兜底]
     ↓
     ├── Chat Agent   → 直接对话
     ├── RAG Agent    → 文档检索 + 问答
@@ -72,8 +72,8 @@ llm:
   openai_base_url: "${OPENAI_BASE_URL}"          # 从环境变量加载 API 地址
   api_key: "${OPENAI_API_KEY}"                   # 从环境变量加载 API 密钥
   model_name: "${OPENAI_MODEL_NAME}"             # 从环境变量加载模型名称
-  temperature: 0.7                               # 温度参数（0-1，越低越确定）
-  max_tokens: 1024                               # 最大输出 token 数
+  temperature: 0.1                               # 温度参数（0-1，越低越确定）
+  max_tokens: 4096                               # 最大输出 token 数
 ```
 
 **支持的 API 来源：**
@@ -90,7 +90,7 @@ milvus:
   port: 19530
   collection_name: "rag_docs"
   embedding_model: "BAAI/bge-small-zh-v1.5"  # HuggingFace 模型，首次自动下载
-  embedding_dim: 768                          # 向量维度（与模型匹配）
+  embedding_dim: 512                          # 向量维度（与模型匹配）
 ```
 
 Embedding 使用 HuggingFace + sentence-transformers 在本地 CPU 运行，无需外部 API。
@@ -104,7 +104,7 @@ rag:
   chunk_overlap: 50    # 分块重叠大小
   top_k: 16            # 先召回候选文档数量
   rerank_enabled: true             # 是否启用重排序
-  rerank_model: "cross-encoder/ms-marco-MiniLM-L12-v2"  # Cross-Encoder 精排模型
+  rerank_model: "BAAI/bge-reranker-base"   # Cross-Encoder 精排模型（中文原生，同时用于路由分类）
   rerank_batch_size: 4             # 批处理大小（内存控制）
   rerank_output_k: 4               # 重排序后输出数量
 ```
@@ -203,12 +203,13 @@ uvicorn app.main:app --reload
 │              FastAPI 接收请求 → /chat 端点                    │
 │                          ↓                                   │
 ├─────────────────────────────────────────────────────────────┤
-│      Main Agent 执行 CoT 推理，决定分发目标：                   │
+│      Main Agent 执行两阶段 Reranker 路由：                      │
 │                                                              │
 │  ┌─────────────────────────────────────────────────────┐   │
-│  │  CoT 推理提示：                                       │   │
-│  │  "你是一个智能路由器。用户问题是：{query}               │   │
-│  │   可用的子代理：chat、rag、mcp"                       │   │
+│  │  Stage 1: Embedding 初筛                            │   │
+│  │  query + category_descriptions → cosine → Top-K     │   │
+│  │  Stage 2: Reranker 精排 + margin→confidence          │   │
+│  │  置信度不足 → CoT LLM 兜底                           │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                          ↓                                   │
 │              ┌─────┬─────┬─────┐                            │
@@ -422,6 +423,19 @@ curl -X POST http://localhost:8000/chat \
 │   ├── temperature          # 温度参数
 │   └── max_tokens           # 最大生成长度
 │
+├── router_llm       # 路由专用 LLM 配置（小模型，CoT 兜底）
+│   ├── openai_base_url      # 路由模型 API 地址
+│   ├── api_key              # API 密钥
+│   ├── model_name           # 模型名称
+│   ├── temperature          # 温度参数（默认 0.1）
+│   └── max_tokens           # 最大输出（默认 256）
+│
+├── router           # 两阶段路由参数
+│   ├── confidence_threshold # 置信度阈值（默认 0.6）
+│   ├── margin_temperature   # margin→confidence 锐度（默认 2.0）
+│   ├── embedding_top_k      # Embedding 初筛保留数（默认 2）
+│   └── category_descriptions # 各代理类别自然语言描述
+│
 ├── milvus           # 向量数据库配置
 │   ├── host                  # Milvus 主机地址
 │   ├── port                  # Milvus 端口
@@ -451,7 +465,8 @@ curl -X POST http://localhost:8000/chat \
 │   ├── api_key               # VL 模型 API 密钥
 │   ├── model_name            # VL 模型名称
 │   ├── temperature           # 温度参数
-│   └── max_tokens            # 最大输出 token
+│   ├── max_tokens            # 最大输出 token
+│   └── phases                # 执行阶段："simple"(提取+回答) / "full"(4阶段含自检)
 │
 ├── main_agent       # 主代理配置
 │   ├── cot_prompt_template   # CoT 推理提示模板

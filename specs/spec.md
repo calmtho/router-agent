@@ -124,11 +124,15 @@
 ### 2.3 Router Node（路由节点）
 
 - **文件**: `app/graph/nodes.py`
-- **职责**: 通过 CoT Prompt 引导 LLM 推理，决策路由到哪个子代理
+- **职责**: 优先通过两阶段 Reranker 快速分类，置信度不足时回退 CoT LLM 兜底路由
+- **路由决策流程**:
+  1. **纯问候/自我介绍**：正则匹配短路，直接路由到 `chat`
+  2. **带附件**：`file_ids` → `rag`、`image_ids` → `vision`（短路跳过所有推理）
+  3. **场景不明**：先调用 `_strip_greeting_prefix()` 剥离问候前缀，再调用 `_classify_via_reranker()` 执行两阶段路由分类
+  4. **Reranker 未命中**：回退 CoT LLM 兜底路由（使用 `router_llm` 独立小模型）
 - **输出格式**: `{"target": "rag|chat|mcp|vision", "reasoning": "..."}`
-- **文件优先短路**: 请求携带 `file_ids` 时，跳过 CoT 推理，直接路由到 RAG Agent（省约 10s+）
 - **降级策略**: 目标代理执行失败时，回退至 `fallback_agent`（默认 `chat`）
-- **图片优先路由**: 当请求携带 `image_ids` 时，CoT Prompt 追加提示优先考虑 vision 子代理
+- **流式路由**：`/chat/stream` 接口中路由决策在流式生成器内完成，不经过 LangGraph 图
 
 ### 2.4 Chat Agent（闲聊代理）
 
@@ -167,25 +171,39 @@
 > | 长文档/跨文档检索 | **RAG 流水线** | 文档超出 LLM 上下文窗口或需要跨文档语义检索时，才需要 chunk → embedding → vector DB → retrieve 的完整流程 |
 > | 长期外挂知识库 | **RAG + 独立索引服务** | 知识需要持续更新、多用户共享时，upload 和 chunk/index 应拆为独立服务（upload 低延迟、限流；index 计算密集、可批量/GPU 加速、独立扩缩容） |
 
-### 2.5.1 Reranker 重排序服务
+### 2.5.1 Reranker 重排序与路由服务
 
 - **文件**: `app/services/reranker_service.py`
-- **模型**: `cross-encoder/ms-marco-MiniLM-L12-v2`（sentence-transformers Cross-Encoder）
+- **模型**: `BAAI/bge-reranker-base`（中文原生 Cross-Encoder，同时用于 RAG 精排与路由分类）
 - **依赖**: `sentence-transformers>=2.7.0`
 - **架构特点**:
   - `get_reranker_service()` 全局单例，全应用共享一个模型实例
-  - lifespan 预加载：模型在服务启动时预加载，避免首次 RAG 请求等待约 11s
+  - lifespan 预加载：模型在服务启动时预加载，避免首次请求等待约 11s
   - 线程锁（`_lock`）防止并发加载
   - `asyncio.to_thread()` 包装同步推理，不阻塞事件循环
   - 模型加载失败时自动降级为原始检索结果，不中断流程
-- **输入/输出**: `rerank(query, documents) -> [(document, score), ...]`，按相关性降序
+- **RAG 精排接口**: `rerank(query, documents) -> [(document, score), ...]`，按相关性降序
+- **两阶段路由分类接口**: `classify_route(query) -> (target, confidence)`
+  - **Stage 1 — Embedding 初筛**：计算 query 与各 `category_descriptions` 的 embedding cosine 相似度，取 `router.embedding_top_k` 个候选
+  - **Stage 2 — Reranker 精排**：Cross-Encoder 对 Top-K 候选精准打分，取最高分与次高分差值 margin，通过 sigmoid 映射为 confidence（`margin_temperature` 控制锐度）
+  - **置信度判断**：confidence ≥ `router.confidence_threshold` 时直接返回 target；否则返回 `"fallback"` 交由 CoT LLM 兜底
 - **配置**:
   ```yaml
   rag:
     rerank_enabled: true                      # 是否启用重排序
-    rerank_model: "cross-encoder/ms-marco-MiniLM-L12-v2"  # 重排序模型
+    rerank_model: "BAAI/bge-reranker-base"    # 重排序模型（中文原生 Cross-Encoder）
     rerank_batch_size: 4                      # 批处理大小
     rerank_output_k: 4                        # 精排后输出数量
+
+  router:
+    confidence_threshold: 0.6                 # 置信度阈值（低于此值回退 CoT）
+    margin_temperature: 2.0                   # margin→confidence sigmoid 锐度
+    embedding_top_k: 2                        # Embedding 初筛保留候选数
+    category_descriptions:                    # 各代理类别的自然语言描述
+      chat:   "日常对话和闲聊..."
+      rag:    "查询文档资料和知识库..."
+      mcp:    "进行数学计算或使用工具..."
+      vision: "分析识别用户上传的图片..."
   ```
 
 ### 2.6 MCP Agent（工具调用代理）
@@ -219,7 +237,7 @@
 
 - **文件**: `app/services/llm_client.py`
 - **方式**: HuggingFaceEmbeddings（本地 CPU 运行）
-- **默认模型**: `BAAI/bge-small-zh-v1.5`（768 维，中文优化）
+- **默认模型**: `BAAI/bge-small-zh-v1.5`（512 维，中文优化）
 - **依赖**: `sentence-transformers>=2.7.0`
 - **特点**: 无需外部 API，首次自动下载模型（约 100MB），之后离线可用
 
@@ -312,6 +330,7 @@
     model_name: "${VL_MODEL_NAME}"
     temperature: 0.1
     max_tokens: 2048
+    phases: "simple"    # "simple"=VL提取+LLM回答(快) / "full"=4阶段含自检+补偿(慢但准确)
   ```
 
 ### 2.13 VL 多模态客户端
@@ -491,14 +510,31 @@ llm:                          # LLM 对话模型（OpenAI 兼容 API）
   api_key: "${OPENAI_API_KEY}" # API 密钥（支持环境变量）
   model_name: "..."           # 模型名
   temperature: 0.1            # 温度参数
-  max_tokens: 1024            # 最大输出 token
+  max_tokens: 4096            # 最大输出 token
+
+router_llm:                   # 路由专用 LLM（小模型，Reranker 置信度不足时 CoT 兜底）
+  openai_base_url: "${ROUTER_LLM_BASE_URL}"     # 路由模型 API 地址
+  api_key: "${ROUTER_LLM_API_KEY}"              # 路由模型 API 密钥
+  model_name: "${ROUTER_LLM_MODEL_NAME}"        # 路由模型名（小模型即可）
+  temperature: 0.1                              # 路由需确定性输出
+  max_tokens: 256                               # 路由只需短 JSON
+
+router:                       # 两阶段路由参数（Embedding 初筛 → Reranker 精排）
+  confidence_threshold: 0.6                     # 低于此分数 fallback CoT
+  margin_temperature: 2.0                       # margin→confidence 映射锐度
+  embedding_top_k: 2                            # Embedding 初筛保留候选数
+  category_descriptions:                        # 各代理类别的自然语言描述
+    chat:   "日常对话和闲聊，比如打招呼、问候、聊天..."
+    rag:    "查询文档资料和知识库..."
+    mcp:    "进行数学计算或使用工具服务..."
+    vision: "分析识别用户上传的图片..."
 
 milvus:                       # 向量数据库 + Embedding
   host: "localhost"           # Milvus 地址
   port: 19530                 # Milvus 端口
   collection_name: "rag_docs" # 集合名
   embedding_model: "BAAI/bge-small-zh-v1.5"  # HuggingFace 模型
-  embedding_dim: 768          # 向量维度
+  embedding_dim: 512          # 向量维度
   index_params:
     metric_type: "IP"         # 相似度度量（IP = 内积，等价余弦）
     index_type: "IVF_FLAT"    # 索引类型
@@ -520,7 +556,7 @@ rag:                          # RAG 参数
   chunk_overlap: 50           # 分块重叠
   top_k: 16                   # 粗排召回候选数量
   rerank_enabled: true        # 是否启用重排序
-  rerank_model: "cross-encoder/ms-marco-MiniLM-L12-v2"  # 重排序模型
+  rerank_model: "BAAI/bge-reranker-base"  # 重排序模型（中文原生 Cross-Encoder）
   rerank_batch_size: 4        # 批处理大小
   rerank_output_k: 4          # 精排后输出数量
 
@@ -535,6 +571,7 @@ vision:                       # VL 多模态模型（图片理解）
   model_name: "${VL_MODEL_NAME}"      # VL 模型名称
   temperature: 0.1                    # 温度参数
   max_tokens: 2048                    # 最大输出 token
+  phases: "simple"                    # "simple"=提取+回答 / "full"=4阶段含自检+补偿
 
 main_agent:                   # 主代理配置（LangGraph 使用）
   cot_prompt_template: |      # CoT 推理提示模板

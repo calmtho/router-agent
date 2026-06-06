@@ -3,8 +3,9 @@ import re
 import uuid
 from typing import Any, AsyncGenerator
 
+from langchain_core.messages import HumanMessage
+
 from app.config import config
-from app.services.llm_client import get_llm_client
 from app.utils.logger import logger
 
 
@@ -13,6 +14,21 @@ class CoTChain:
 
     def __init__(self):
         self.prompt_template = config.main_agent.cot_prompt_template
+        self._router_llm = None
+
+    @property
+    def router_llm(self):
+        """路由专用小模型（懒加载，与聊天主 LLM 分离）"""
+        if self._router_llm is None:
+            from langchain_openai import ChatOpenAI
+            self._router_llm = ChatOpenAI(
+                base_url=config.router_llm.openai_base_url,
+                api_key=config.router_llm.api_key,
+                model=config.router_llm.model_name,
+                temperature=config.router_llm.temperature,
+                max_tokens=config.router_llm.max_tokens,
+            )
+        return self._router_llm
 
     async def route(self, query: str, has_file: bool = False, has_image: bool = False,
                     original_query: str | None = None) -> dict[str, str]:
@@ -26,10 +42,6 @@ class CoTChain:
         if has_file:
             prompt += "\n注意：用户已上传文件，优先考虑 RAG 子代理。"
 
-        messages = [
-            {"role": "user", "content": prompt},
-        ]
-
         langfuse = get_langfuse_client()
 
         max_retries = 3
@@ -40,7 +52,8 @@ class CoTChain:
 
         for attempt in range(1, max_retries + 1):
             try:
-                response = await get_llm_client().chat(messages, temperature=0.3)
+                response = await self.router_llm.ainvoke([HumanMessage(content=prompt)])
+                response = response.content
 
                 # 清洗推理模型的 <think>...</think> 标签，避免 JSON 解析失败
                 response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()

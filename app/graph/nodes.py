@@ -63,19 +63,37 @@ async def preprocess_node(state: AgentState) -> AgentState:
 
 async def router_node(state: AgentState) -> AgentState:
     """
-    CoT 路由节点 - 使用现有的 cot_chain 进行路由决策
-
-    从 LLM 获取智能路由决策，决定由哪个子代理处理请求。
+    CoT 路由节点 - 优先使用 Reranker 快速分类，置信度不够则走 LLM CoT 兜底
     """
-    # 延迟导入，避免循环依赖
     from app.chains.cot_chain import cot_chain
 
     has_file = bool(state.get("file_ids"))
     has_image = bool(state.get("image_ids"))
 
+    # ── 阶段 1：Reranker 快速路由 ──
     try:
-        # 调用 CoT 链进行路由决策
-        # cot_chain.route 内部已包含 Langfuse 追踪
+        from app.services.reranker_service import get_reranker_service
+
+        reranker = get_reranker_service()
+        if reranker.is_ready:
+            target, confidence = await reranker.classify_route(state["message"])
+            logger.info(f"[Router] Reranker: target={target}, confidence={confidence:.3f}")
+
+            if confidence >= config.router.confidence_threshold:
+                return {
+                    "target_agent": target,
+                    "cot_reasoning": f"Reranker 快速路由 (置信度={confidence:.2f})",
+                }
+            else:
+                logger.info(
+                    f"[Router] 置信度不足 ({confidence:.3f} < {config.router.confidence_threshold})，"
+                    f"回退 CoT"
+                )
+    except Exception as e:
+        logger.warning(f"[Router] Reranker 路由失败，回退 CoT: {e}")
+
+    # ── 阶段 2：LLM CoT 兜底路由 ──
+    try:
         routing_result = await cot_chain.route(
             state["message"],
             has_file=has_file,

@@ -56,7 +56,7 @@
 | `tests/test_paddle.py` | - | PaddleOCR API 集成测试（需 token，独立运行） |
 | `tests/test_stt_local.py` | - | FunASR 语音转写本地测试（首次启动下载模型） |
 | `tests/test_preprocess.py` | 3 | 预处理管道：TypoService 纠错、preprocess_node 集成、配置 |
-| `tests/test_reranker.py` | - | Cross-Encoder 重排序模型加载与精排测试（非 pytest 用例） |
+| `tests/test_reranker.py` | - | Reranker 模型加载、RAG 精排、两阶段路由分类测试（非 pytest 用例） |
 | `tests/test_vision_e2e.py` | - | Vision 端到端测试：自动启动服务→上传图片→图文问答（独立运行） |
 | `tests/test_imports.py` | - | 模块导入检查（非 pytest 用例） |
 
@@ -152,7 +152,7 @@
 - ✅ 文本分块算法（Markdown 标题层级切片 + 字符分割）
 - ✅ 会话历史管理（标题摘要、滚动摘要、滑动窗口、历史裁剪、标题与摘要独立共存）
 - ✅ 预处理管道（错字纠正 + 敏感词过滤，`test_preprocess.py`）
-- ✅ Cross-Encoder 重排序精排（模型加载、降级机制、排序逻辑，`test_reranker.py`）
+- ✅ Reranker 精排 + 两阶段路由分类（模型加载、降级机制、排序逻辑、classify_route，`test_reranker.py`）
 - ✅ Vision 图片理解端到端（上传图片→图文问答，`test_vision_e2e.py`）
 - ⚠️ CoT 推理链（需 LLM 服务）
 - ⚠️ 代理系统（需 LLM / Milvus 服务）
