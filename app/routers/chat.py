@@ -118,6 +118,9 @@ async def chat(body: ChatRequest) -> dict[str, Any]:
         if inherited:
             image_ids = inherited
 
+    # file_ids 空值安全处理
+    file_ids = body.file_ids or []
+
     # 构建初始状态
     initial_state = {
         "message": body.message,
