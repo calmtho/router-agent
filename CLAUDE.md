@@ -1,7 +1,7 @@
 # 项目概述
-本项目实现一个基于 Chain‑of‑Thought (CoT) 的 Main‑Sub Agent 架构智能代理系统，具备以下核心能力：
+本项目实现一个基于两阶段 Reranker 意图识别的 Main-Sub Agent 架构智能代理系统，具备以下核心能力：
 
-1. **智能路由**：主代理通过两阶段 Reranker 路由（Embedding 初筛 → Reranker 精排）优先决策分发至合适的子代理（闲聊 / RAG / MCP / Vision），置信度不足时由 CoT 推理兜底。携带 file_ids 时短路直接路由到 RAG Agent；携带 image_ids 时短路直接路由到 Vision Agent。
+1. **智能意图识别**：主代理通过两阶段 Reranker 意图识别（Embedding 初筛 → Reranker 精排）优先决策分发至合适的子代理（闲聊 / RAG / MCP / Vision），置信度不足时由 LLM 意图识别兜底。携带 file_ids 时短路直接路由到 RAG Agent；携带 image_ids 时短路直接路由到 Vision Agent。
 2. **错别字纠正**：预处理管道第一步，基于 macbert4csc 自动纠正中文错别字，纠正后保留原文到 `original_message`。
 3. **内容安全过滤**：预处理管道第二步，检测并拦截包含敏感词的用户请求，防止不当内容进入系统。
 4. **MCP 工具调用**：子代理遵循 Model Context Protocol 调用外部工具。MCP Server 通过 stdio 子进程启动，支持计算器、网页抓取等工具。自定义 Server 可放在 `app/mcp_servers/` 目录下，在 `config.yaml` 中注册即可。
@@ -50,7 +50,7 @@
 │   │   ├── mcp_agent.py        # MCP 工具调用子代理
 │   │   └── vision_agent.py     # 图片理解子代理（小VL+大LLM 4阶段架构）
 │   ├── chains/
-│   │   ├── cot_chain.py        # CoT 推理链（Prompt + 解析）
+│   │   ├── cot_chain.py        # 意图识别链（Prompt + 解析）
 │   │   └── rag_chain.py        # LangChain RAG 链
 │   ├── data/                   # 数据文件
 │   │   └── sensitive_words.py  # 敏感词词典（内容安全过滤）
@@ -70,7 +70,7 @@
 │   │   ├── history_service.py  # 对话历史管理（标题/摘要生成、滑动窗口、历史裁剪）
 │   │   ├── llm_client.py       # LLM 客户端 + 本地 Embedding
 │   │   ├── stt_service.py      # STT 语音转写服务（FunASR Paraformer-zh 封装）
-│   │   ├── reranker_service.py # 检索精排 + 两阶段路由分类（Embedding初筛→Reranker精排→CoT兜底）
+│   │   ├── reranker_service.py # 检索精排 + 两阶段意图识别（Embedding初筛→Reranker精排→LLM兜底）
 │   │   ├── vl_client.py        # VL 多模态客户端（OpenAI 兼容，Base64 data URI 传图）
 │   │   ├── session_context_service.py # Session Context（TTL 图片ID继承，跨轮保持）
 │   │   └── typo_service.py     # 错别字纠正服务（macbert4csc 封装）
@@ -102,7 +102,7 @@
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml          # 包含 Milvus, etcd, minio
-├── CLAUDE.md                   # 本文件
+├── CLAUDE.md                   # 项目说明文档
 ├── specs/
 │   └── spec.md               # 技术规格说明书（事实标准）
 ```
@@ -161,7 +161,7 @@ curl -X POST http://localhost:8000/stt/transcribe \
 # 开发约定
 
 1. **内容安全过滤**：敏感词词典位于 `app/data/sensitive_words.py`，预处理节点 `preprocess_node` 在图入口处进行错字纠正→敏感词过滤。
-2. **LangGraph 路由**：使用 `app.graph.graph.app_graph` 执行请求路由，`router_node` 优先通过两阶段 Reranker（Embedding 初筛 → Reranker 精排）快速分类，置信度不足时回退 CoT LLM 兜底。
+2. **LangGraph 意图识别**：使用 `app.graph.graph.app_graph` 执行请求意图识别，`router_node` 优先通过两阶段 Reranker（Embedding 初筛 → Reranker 精排）快速分类，置信度不足时回退 LLM 意图识别兜底。
 3. **子代理注册**：所有子代理需继承 `SubAgentBase` 并实现 `can_handle()` 与 `handle()` 方法。
 4. **配置优先级**：YAML 文件 → 环境变量（`APP_*`）→ 默认值。
 5. **错误处理**：MCP 工具调用失败时降级为闲聊响应，RAG 检索为空时回退至生成式回答。
@@ -185,11 +185,11 @@ curl -X POST http://localhost:8000/stt/transcribe \
    - **配置开关**：`preprocess.enable_typo_correction` 控制是否启用，关闭时跳过纠错步骤。
    - **状态保留**：纠错后原文存入 `original_message`，纠正后文本存入 `message`，供后续节点和 LLM 使用。
    - **配置**：`preprocess.typo_model` 指定模型名，默认 `shibing624/macbert4csc-base-chinese`。
-11. **重排序与路由服务**：`app/services/reranker_service.py` 实现基于 Cross-Encoder 的两阶段检索精排与路由分类：
+11. **重排序与意图识别服务**：`app/services/reranker_service.py` 实现基于 Cross-Encoder 的两阶段检索精排与意图识别：
    - **全局单例**：`get_reranker_service()` 保证全应用共享一个模型实例。
    - **异步隔离**：使用 `asyncio.to_thread()` 将同步推理丢到独立线程，不阻塞事件循环。
    - **RAG 精排**：`rerank(query, documents)` 对检索结果重排序，`rag.rerank_enabled` 控制开关，加载失败自动降级。
-   - **两阶段路由分类**：`classify_route(query)` 先由 Embedding 模型计算 query 与各 category description 的 cosine 相似度取 Top-K，再由 Reranker 精准打分 + margin→confidence sigmoid 映射。置信度 ≥ `router.confidence_threshold` 时直接返回目标；否则返回 "fallback" 交由 CoT LLM 兜底。
+   - **两阶段意图识别**：`classify_route(query)` 先由 Embedding 模型计算 query 与各 category description 的 cosine 相似度取 Top-K，再由 Reranker 精准打分 + margin→confidence sigmoid 映射。置信度 ≥ `router.confidence_threshold` 时直接返回目标；否则返回 "fallback" 交由 LLM 意图识别兜底。
    - **lifespan 预加载**：模型在 `app.main:lifespan` 启动时预加载，避免首次请求等待约 11s。
    - **配置**：`rag.rerank_model` 指定模型名（默认 `BAAI/bge-reranker-base`）；`rag.rerank_batch_size` 控制批处理大小；`rag.rerank_output_k` 控制精排后输出数量。
    - **路由参数**：`router.confidence_threshold`（置信度阈值）、`router.margin_temperature`（margin→confidence 锐度）、`router.embedding_top_k`（Embedding 初筛保留数）、`router.category_descriptions`（各代理类别描述）。

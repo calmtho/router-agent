@@ -1,12 +1,12 @@
 # Router Agent - 智能代理系统
 
-基于两阶段 Reranker 路由 + CoT 兜底的 Main-Sub Agent 架构智能代理，支持智能路由、文档问答、工具调用和对话交互。
+基于两阶段 Reranker 意图识别 + LLM 兜底的 Main-Sub Agent 架构智能代理，支持智能意图识别、文档问答、工具调用和对话交互。
 
 ## 🌟 功能特性
 
 | 功能 | 描述 |
 |------|------|
-| **智能路由** | 主代理通过两阶段 Reranker（Embedding 初筛→Reranker 精排）优先决策分发，置信度不足时 CoT 兜底 |
+| **智能意图识别** | 主代理通过两阶段 Reranker（Embedding 初筛→Reranker 精排）优先决策分发，置信度不足时 LLM 意图识别兜底 |
 | **错别字纠正** | 基于 macbert4csc 的中文错别字自动纠正，预处理管道第一步 |
 | **文档问答** | 基于 Milvus 向量库 + 两阶段检索（粗排→Cross-Encoder 精排）的 RAG 增强，支持 PDF、TXT、MD、DOCX 文件 |
 | **图片理解** | 小 VL + 大 LLM 模式，4 阶段架构（VL 特征提取→LLM 自检→补偿轮→LLM 回答），支持 jpg/png/webp/gif/bmp/tiff |
@@ -26,7 +26,7 @@
     ↓
 [FastAPI /chat 接口]
     ↓
-[路由决策：纯问候 → chat / 带附件 → 短路 / 其他 → 两阶段 Reranker → CoT 兜底]
+[意图识别：纯问候 → chat / 带附件 → 短路 / 其他 → 两阶段 Reranker → LLM 兜底]
     ↓
     ├── Chat Agent   → 直接对话
     ├── RAG Agent    → 文档检索 + 问答
@@ -209,7 +209,7 @@ uvicorn app.main:app --reload
 │  │  Stage 1: Embedding 初筛                            │   │
 │  │  query + category_descriptions → cosine → Top-K     │   │
 │  │  Stage 2: Reranker 精排 + margin→confidence          │   │
-│  │  置信度不足 → CoT LLM 兜底                           │   │
+│  │  置信度不足 → LLM 意图识别兜底                           │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                          ↓                                   │
 │              ┌─────┬─────┬─────┐                            │
@@ -299,7 +299,7 @@ curl -X POST http://localhost:8000/chat \
 **响应示例：**
 ```json
 {
-  "reply": "你好！我是 Router Agent，一个基于 CoT 的智能代理系统...",
+  "reply": "你好！我是 Router Agent，一个基于两阶段 Reranker 意图识别的智能代理系统...",
   "agent_used": "chat",
   "cot_reasoning": "一般问候对话"
 }
@@ -423,14 +423,14 @@ curl -X POST http://localhost:8000/chat \
 │   ├── temperature          # 温度参数
 │   └── max_tokens           # 最大生成长度
 │
-├── router_llm       # 路由专用 LLM 配置（小模型，CoT 兜底）
+├── router_llm       # 路由专用 LLM 配置（小模型兜底）
 │   ├── openai_base_url      # 路由模型 API 地址
 │   ├── api_key              # API 密钥
 │   ├── model_name           # 模型名称
 │   ├── temperature          # 温度参数（默认 0.1）
 │   └── max_tokens           # 最大输出（默认 256）
 │
-├── router           # 两阶段路由参数
+├── router           # 两阶段路由参数（Embedding 初筛 → Reranker 精排 → Intent Recognition 置信度）
 │   ├── confidence_threshold # 置信度阈值（默认 0.6）
 │   ├── margin_temperature   # margin→confidence 锐度（默认 2.0）
 │   ├── embedding_top_k      # Embedding 初筛保留数（默认 2）
@@ -469,7 +469,7 @@ curl -X POST http://localhost:8000/chat \
 │   └── phases                # 执行阶段："simple"(提取+回答) / "full"(4阶段含自检)
 │
 ├── main_agent       # 主代理配置
-│   ├── cot_prompt_template   # CoT 推理提示模板
+│   ├── cot_prompt_template   # 意图识别推理提示模板
 │   └── fallback_agent        # 降级代理
 │
 ├── preprocess       # 预处理管道配置
@@ -524,14 +524,14 @@ router_agent/
 │   ├── main.py                 # FastAPI 应用入口
 │   ├── config.py               # 配置管理
 │   ├── agents/                 # 代理模块
-│   │   ├── main_agent.py       # CoT 主代理
+│   │   ├── main_agent.py       # 意图识别主代理
 │   │   ├── sub_agent_base.py   # 子代理基类
 │   │   ├── chat_agent.py       # 闲聊代理
 │   │   ├── rag_agent.py        # RAG 代理
 │   │   ├── mcp_agent.py        # MCP 工具代理
 │   │   └── vision_agent.py     # 图片理解代理（小VL+大LLM 4阶段架构）
 │   ├── chains/                 # LangChain 链
-│   │   ├── cot_chain.py        # CoT 推理链
+│   │   ├── cot_chain.py        # 意图识别链
 │   │   └── rag_chain.py        # RAG 检索链
 │   ├── routers/                # API 路由
 │   │   ├── chat.py             # 聊天接口

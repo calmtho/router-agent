@@ -56,7 +56,7 @@
 | `tests/test_paddle.py` | - | PaddleOCR API 集成测试（需 token，独立运行） |
 | `tests/test_stt_local.py` | - | FunASR 语音转写本地测试（首次启动下载模型） |
 | `tests/test_preprocess.py` | 3 | 预处理管道：TypoService 纠错、preprocess_node 集成、配置 |
-| `tests/test_reranker.py` | - | Reranker 模型加载、RAG 精排、两阶段路由分类测试（非 pytest 用例） |
+| `tests/test_reranker.py` | - | Reranker 模型加载、RAG 精排、两阶段意图识别分类测试（非 pytest 用例） |
 | `tests/test_vision_e2e.py` | - | Vision 端到端测试：自动启动服务→上传图片→图文问答（独立运行） |
 | `tests/test_imports.py` | - | 模块导入检查（非 pytest 用例） |
 
@@ -152,15 +152,15 @@
 - ✅ 文本分块算法（Markdown 标题层级切片 + 字符分割）
 - ✅ 会话历史管理（标题摘要、滚动摘要、滑动窗口、历史裁剪、标题与摘要独立共存）
 - ✅ 预处理管道（错字纠正 + 敏感词过滤，`test_preprocess.py`）
-- ✅ Reranker 精排 + 两阶段路由分类（模型加载、降级机制、排序逻辑、classify_route，`test_reranker.py`）
+- ✅ Reranker 精排 + 两阶段意图识别分类（模型加载、降级机制、排序逻辑、classify_route，`test_reranker.py`）
 - ✅ Vision 图片理解端到端（上传图片→图文问答，`test_vision_e2e.py`）
-- ⚠️ CoT 推理链（需 LLM 服务）
+- ⚠️ 意图识别链（需 LLM 服务）
 - ⚠️ 代理系统（需 LLM / Milvus 服务）
-- ⚠️ 主代理路由逻辑（需 LLM 服务）
+- ⚠️ 主代理意图识别逻辑（需 LLM 服务）
 - ⚠️ STT 语音转写（需 FunASR 模型，首次下载后本地运行）
 
 ### 建议增加的测试
-1. **CoT 链 mock 测试** - 使用 mock LLM 测试路由推理逻辑
+1. **意图识别链 mock 测试** - 使用 mock LLM 测试意图识别推理逻辑
 2. **代理系统 mock 测试** - mock 外部服务，覆盖各代理分支
 3. **API 端点测试** - 使用 FastAPI TestClient 测试 /chat、/upload 接口
 4. **错误处理边界测试** - 异常输入、超大文件、空内容等
@@ -193,7 +193,7 @@
 - PDF 解析升级为 PaddleOCR 云端 OCR，依赖精简
 
 **待改进**:
-- CoT 链和代理系统缺少 mock 测试
+- 意图识别链和代理系统缺少 mock 测试
 - API 端点缺少集成测试
 - 递归函数缺深度限制
 
@@ -207,6 +207,6 @@
 7. ✅ SPEC.md 迁移至 `specs/spec.md` 作为唯一事实标准，根目录不再放设计文档
 8. ✅ 两阶段检索精排（reranker_service.py + test_reranker.py）
 9. ✅ 图片理解功能实现与归档（vision_agent.py、vl_client.py、upload_image.py、session_context_service.py、test_vision_e2e.py）
-10. 🔄 增加 CoT 链和代理的 mock 测试
+10. 🔄 增加意图识别链和代理的 mock 测试
 11. 🔄 增加 API 端点集成测试（FastAPI TestClient）
 12. 📊 优化测试覆盖目标至 80%+

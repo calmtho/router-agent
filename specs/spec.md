@@ -48,7 +48,7 @@
 1. 用户上传文件 → 服务端立即返回 `file_id`（status: processing）
 2. 后台异步执行：解析文本 → 切片 → 向量化 → 写入 Milvus
 3. 前端轮询 `/upload/status/{file_id}`，处理完成获得 status: ready
-4. 用户发送消息并附带 `file_ids` → Router 路由到 RAG Agent → Milvus 检索相关 chunk → LLM 生成回答
+4. 用户发送消息并附带 `file_ids` → Router 意图识别到 RAG Agent → Milvus 检索相关 chunk → LLM 生成回答
 
 ### 1.2 图片上传交互流程
 
@@ -56,7 +56,7 @@
 
 1. 用户上传图片 → 服务端立即返回 `image_id`、文件名、文件大小
 2. 图片保存在 `uploads/images/` 目录，元信息持久化到 `.registry.json`
-3. 用户发送消息并附带 `image_ids` → Preprocess 解析图片路径 → Router 优先路由到 Vision Agent
+3. 用户发送消息并附带 `image_ids` → Preprocess 解析图片路径 → Router 优先意图识别到 Vision Agent
 4. Vision Agent 执行 4 阶段处理（VL 特征提取 → LLM 自检 → 补偿轮 → LLM 回答）
 5. Session Context 自动继承 image_ids，后续对话无需重复指定
 
@@ -121,18 +121,18 @@
     typo_model: "shibing624/macbert4csc-base-chinese"
   ```
 
-### 2.3 Router Node（路由节点）
+### 2.3 Router Node（意图识别节点）
 
 - **文件**: `app/graph/nodes.py`
-- **职责**: 优先通过两阶段 Reranker 快速分类，置信度不足时回退 CoT LLM 兜底路由
-- **路由决策流程**:
+- **职责**: 优先通过两阶段 Reranker 快速分类，置信度不足时回退 LLM 意图识别兜底
+- **意图识别决策流程**:
   1. **纯问候/自我介绍**：正则匹配短路，直接路由到 `chat`
   2. **带附件**：`file_ids` → `rag`、`image_ids` → `vision`（短路跳过所有推理）
-  3. **场景不明**：先调用 `_strip_greeting_prefix()` 剥离问候前缀，再调用 `_classify_via_reranker()` 执行两阶段路由分类
-  4. **Reranker 未命中**：回退 CoT LLM 兜底路由（使用 `router_llm` 独立小模型）
+  3. **场景不明**：先调用 `_strip_greeting_prefix()` 剥离问候前缀，再调用 `_classify_via_reranker()` 执行两阶段意图识别分类
+  4. **Reranker 未命中**：回退 LLM 意图识别兜底（使用 `router_llm` 独立小模型）
 - **输出格式**: `{"target": "rag|chat|mcp|vision", "reasoning": "..."}`
 - **降级策略**: 目标代理执行失败时，回退至 `fallback_agent`（默认 `chat`）
-- **流式路由**：`/chat/stream` 接口中路由决策在流式生成器内完成，不经过 LangGraph 图
+- **流式意图识别**：`/chat/stream` 接口中意图识别决策在流式生成器内完成，不经过 LangGraph 图
 
 ### 2.4 Chat Agent（闲聊代理）
 
@@ -171,10 +171,10 @@
 > | 长文档/跨文档检索 | **RAG 流水线** | 文档超出 LLM 上下文窗口或需要跨文档语义检索时，才需要 chunk → embedding → vector DB → retrieve 的完整流程 |
 > | 长期外挂知识库 | **RAG + 独立索引服务** | 知识需要持续更新、多用户共享时，upload 和 chunk/index 应拆为独立服务（upload 低延迟、限流；index 计算密集、可批量/GPU 加速、独立扩缩容） |
 
-### 2.5.1 Reranker 重排序与路由服务
+### 2.5.1 Reranker 重排序与意图识别服务
 
 - **文件**: `app/services/reranker_service.py`
-- **模型**: `BAAI/bge-reranker-base`（中文原生 Cross-Encoder，同时用于 RAG 精排与路由分类）
+- **模型**: `BAAI/bge-reranker-base`（中文原生 Cross-Encoder，同时用于 RAG 精排与意图识别分类）
 - **依赖**: `sentence-transformers>=2.7.0`
 - **架构特点**:
   - `get_reranker_service()` 全局单例，全应用共享一个模型实例
@@ -183,10 +183,10 @@
   - `asyncio.to_thread()` 包装同步推理，不阻塞事件循环
   - 模型加载失败时自动降级为原始检索结果，不中断流程
 - **RAG 精排接口**: `rerank(query, documents) -> [(document, score), ...]`，按相关性降序
-- **两阶段路由分类接口**: `classify_route(query) -> (target, confidence)`
+- **两阶段意图识别分类接口**: `classify_route(query) -> (target, confidence)`
   - **Stage 1 — Embedding 初筛**：计算 query 与各 `category_descriptions` 的 embedding cosine 相似度，取 `router.embedding_top_k` 个候选
   - **Stage 2 — Reranker 精排**：Cross-Encoder 对 Top-K 候选精准打分，取最高分与次高分差值 margin，通过 sigmoid 映射为 confidence（`margin_temperature` 控制锐度）
-  - **置信度判断**：confidence ≥ `router.confidence_threshold` 时直接返回 target；否则返回 `"fallback"` 交由 CoT LLM 兜底
+  - **置信度判断**：confidence ≥ `router.confidence_threshold` 时直接返回 target；否则返回 `"fallback"` 交由 LLM 意图识别兜底
 - **配置**:
   ```yaml
   rag:
@@ -196,7 +196,7 @@
     rerank_output_k: 4                        # 精排后输出数量
 
   router:
-    confidence_threshold: 0.6                 # 置信度阈值（低于此值回退 CoT）
+    confidence_threshold: 0.6                 # 置信度阈值（低于此值回退 LLM 意图识别）
     margin_temperature: 2.0                   # margin→confidence sigmoid 锐度
     embedding_top_k: 2                        # Embedding 初筛保留候选数
     category_descriptions:                    # 各代理类别的自然语言描述
@@ -301,7 +301,7 @@
 - **文件**: `app/services/stt_service.py` + `app/routers/stt.py`
 - **模型**: FunASR Paraformer-zh（~840MB，含 VAD + 标点恢复子模型）
 - **依赖**: `funasr>=1.0.0`, `modelscope>=1.0.0`, `soundfile>=0.12.0`
-- **输入**: 16kHz mono WAV（路由层通过 `_ensure_wav()` 兜底转换 mp3/webm/ogg 等）
+- **输入**: 16kHz mono WAV（意图识别层通过 `_ensure_wav()` 兜底转换 mp3/webm/ogg 等）
 - **输出**: 带标点的中文文本
 - **架构特点**:
   - lifespan 启动时预加载模型，避免首次请求等待
@@ -409,7 +409,7 @@
 
 ### 3.3 POST /chat
 
-发送消息，由 Main Agent 路由到合适的子代理处理。
+发送消息，由 Main Agent 意图识别到合适的子代理处理。
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
@@ -512,18 +512,18 @@ llm:                          # LLM 对话模型（OpenAI 兼容 API）
   temperature: 0.1            # 温度参数
   max_tokens: 4096            # 最大输出 token
 
-router_llm:                   # 路由专用 LLM（小模型，Reranker 置信度不足时 CoT 兜底）
+router_llm:                   # 路由专用 LLM（小模型，Reranker 置信度不足时LLLM兜底）
   openai_base_url: "${ROUTER_LLM_BASE_URL}"     # 路由模型 API 地址
   api_key: "${ROUTER_LLM_API_KEY}"              # 路由模型 API 密钥
   model_name: "${ROUTER_LLM_MODEL_NAME}"        # 路由模型名（小模型即可）
   temperature: 0.1                              # 路由需确定性输出
   max_tokens: 256                               # 路由只需短 JSON
 
-router:                       # 两阶段路由参数（Embedding 初筛 → Reranker 精排）
-  confidence_threshold: 0.6                     # 低于此分数 fallback CoT
+router:                       # 两阶段路由参数（Embedding 初筛 → Reranker 精排 → Intent Recognition 置信度）
+  confidence_threshold: 0.6                     # 低于此分数 fallback LLM
   margin_temperature: 2.0                       # margin→confidence 映射锐度
   embedding_top_k: 2                            # Embedding 初筛保留候选数
-  category_descriptions:                        # 各代理类别的自然语言描述
+  category_descriptions:                        # 各代理类别的自然语言描述（用于 Intent Recognition）
     chat:   "日常对话和闲聊，比如打招呼、问候、聊天..."
     rag:    "查询文档资料和知识库..."
     mcp:    "进行数学计算或使用工具服务..."
@@ -574,7 +574,7 @@ vision:                       # VL 多模态模型（图片理解）
   phases: "simple"                    # "simple"=提取+回答 / "full"=4阶段含自检+补偿
 
 main_agent:                   # 主代理配置（LangGraph 使用）
-  cot_prompt_template: |      # CoT 推理提示模板
+  cot_prompt_template: |      # 意图识别推理提示模板（用于LLM兜底）
     ...
   fallback_agent: "chat"      # 降级代理
 
@@ -678,7 +678,7 @@ class SubAgentBase:
 
 项目集成 Langfuse 进行 LLM 调用链路追踪，自动记录：
 - **Trace**：单次请求的完整调用链（Main Agent → 子代理 → LLM）
-- **Span**：关键步骤的耗时（CoT 推理、RAG 检索、MCP 工具调用）
+- **Span**：关键步骤的耗时（意图识别推理、RAG 检索、MCP 工具调用）
 - **Generation**：LLM 调用详情（输入/输出 tokens、耗时、模型名）
 
 ### 9.2 配置方式
@@ -701,7 +701,7 @@ LANGFUSE_BASE_URL=https://cloud.langfuse.com
 
 | 操作 | Trace 名称 | Span 名称 |
 |------|------------|-----------|
-| Main Agent 路由 | `main_agent` | `cot_routing` |
+| Main Agent 意图识别 | `main_agent` | `intent_routing` |
 | Chat Agent | `chat_agent` | `chat_agent` |
 | RAG Agent | `rag_agent` | `rag_agent` |
 | MCP Agent | `mcp_agent` | `mcp_agent` |

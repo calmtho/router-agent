@@ -17,7 +17,7 @@ class LLMConfig(BaseModel):
 
 
 class RouterLLMConfig(BaseModel):
-    """路由专用 LLM 配置（小模型，仅用于 reranker 置信度不足时的 CoT 兜底路由）"""
+    """路由专用 LLM 配置（小模型，仅用于 reranker 置信度不足时的 LLM 兜底）"""
     openai_base_url: str
     api_key: str
     model_name: str

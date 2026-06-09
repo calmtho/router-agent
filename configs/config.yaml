@@ -5,7 +5,7 @@ llm:
   temperature: 0.1
   max_tokens: 4096
 
-# 路由专用 LLM（小模型，仅用于 reranker 置信度不足时的 CoT 兜底路由）
+# 意图识别专用 LLM（小模型，仅用于 reranker 置信度不足时的 LLM 兜底）
 router_llm:
   openai_base_url: "${ROUTER_LLM_BASE_URL}"
   api_key: "${ROUTER_LLM_API_KEY}"
@@ -15,7 +15,7 @@ router_llm:
 
 # 路由配置（Embedding 初筛 → Reranker 精排 → Margin 置信度）
 router:
-  confidence_threshold: 0.6                     # 低于此分数 fallback 到 router_llm CoT 兜底
+  confidence_threshold: 0.6                     # 低于此分数 fallback 到 router_llm LLM 意图识别兜底
   margin_temperature: 2.0                       # margin→confidence 映射锐度，越大越严格
   embedding_top_k: 2                            # Embedding 初筛保留前几名，再交给 Reranker 精排
   category_descriptions:
